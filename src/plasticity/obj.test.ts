@@ -62,3 +62,41 @@ test("an all-quad mesh reports zero triangle faces and n-gons", () => {
   const result = validateObj(Buffer.from("v 0 0 0\nv 1 0 0\nv 1 1 0\nv 0 1 0\nf 1 2 3 4\n"));
   assert.deepEqual([result.triangleFaces, result.quads, result.ngons], [0, 1, 0]);
 });
+
+import { objMaterialLibraries, rewriteObjMaterialLibraries } from "./obj.ts";
+
+test("reports per-object counts and bounds when several o groups exist", () => {
+  const result = validateObj(Buffer.from(`mtllib geometry.mtl
+o A
+v 0 0 0
+v 1 0 0
+v 1 1 0
+v 0 1 0
+f 1 2 3 4
+o B
+v 10 0 0
+v 12 0 0
+v 10 5 0
+f 5 6 7
+f -3 -2 -1
+`));
+  assert.equal(result.objects, 2);
+  assert.equal(result.faces, 3);
+  assert.deepEqual(result.perObject, [
+    { name: "A", vertices: 4, faces: 1, triangles: 2, triangleFaces: 0, quads: 1, ngons: 0, boundsMm: { min: [0, 0, 0], max: [1, 1, 0], size: [1, 1, 0] } },
+    { name: "B", vertices: 3, faces: 2, triangles: 2, triangleFaces: 2, quads: 0, ngons: 0, boundsMm: { min: [10, 0, 0], max: [12, 5, 0], size: [2, 5, 0] } },
+  ]);
+});
+
+test("omits perObject for a single object", () => {
+  assert.equal("perObject" in validateObj(Buffer.from("o A\nv 0 0 0\nv 1 0 0\nv 0 1 0\nf 1 2 3\n")), false);
+});
+
+test("lists and rewrites mtllib references without touching other bytes", () => {
+  const data = Buffer.from("# c\r\nmtllib geometry.mtl\r\no A\r\nv 0 0 0\r\n");
+  assert.deepEqual(objMaterialLibraries(data), ["geometry.mtl"]);
+  const rewritten = rewriteObjMaterialLibraries(data, new Map([["geometry.mtl", "stick.mtl"]]));
+  assert.equal(rewritten.toString(), "# c\r\nmtllib stick.mtl\r\no A\r\nv 0 0 0\r\n");
+  assert.equal(rewriteObjMaterialLibraries(data, new Map([["other.mtl", "x.mtl"]])), data);
+  assert.equal(rewriteObjMaterialLibraries(Buffer.from("mtllib /tmp/x/geometry.mtl\n"), new Map([["geometry.mtl", "a b.mtl"]])).toString(), "mtllib a b.mtl\n");
+});

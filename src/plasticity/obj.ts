@@ -21,6 +21,60 @@ export interface ObjValidation {
     max: [number, number, number];
     size: [number, number, number];
   };
+  /** Per `o` group counts. Present only when the file declares more than one object. */
+  perObject?: ObjObjectSummary[];
+}
+
+export interface ObjObjectSummary {
+  name: string;
+  /** `v` lines declared while this object was active. */
+  vertices: number;
+  faces: number;
+  triangles: number;
+  triangleFaces: number;
+  quads: number;
+  ngons: number;
+  /** Bounds of the vertices referenced by this object's faces. */
+  boundsMm: ObjValidation["boundsMm"] | null;
+}
+
+interface ObjectAccumulator {
+  name: string;
+  vertices: number;
+  faces: number;
+  triangles: number;
+  triangleFaces: number;
+  quads: number;
+  ngons: number;
+  min: [number, number, number] | null;
+  max: [number, number, number] | null;
+}
+
+/** Names referenced by `mtllib` lines (the rest of each line, trimmed). */
+export function objMaterialLibraries(data: Buffer): string[] {
+  const names: string[] = [];
+  for (const rawLine of data.toString("utf8").split(/\r?\n/u)) {
+    const match = /^\s*mtllib\s+(.+?)\s*$/u.exec(rawLine);
+    if (match) names.push(match[1]!);
+  }
+  return names;
+}
+
+/**
+ * Rewrites `mtllib` references whose basename appears in `renames` (old basename -> new basename).
+ * Everything else, including line endings, is preserved byte for byte.
+ */
+export function rewriteObjMaterialLibraries(data: Buffer, renames: Map<string, string>): Buffer {
+  const text = data.toString("utf8");
+  let changed = false;
+  const rewritten = text.replace(/^(\s*mtllib\s+)(.+?)(\s*)$/gmu, (whole, prefix: string, name: string, suffix: string) => {
+    const base = name.split(/[\\/]/u).pop()!;
+    const replacement = renames.get(base);
+    if (replacement === undefined) return whole;
+    changed = true;
+    return `${prefix}${replacement}${suffix}`;
+  });
+  return changed ? Buffer.from(rewritten, "utf8") : data;
 }
 
 export function validateObj(data: Buffer): ObjValidation {
@@ -34,6 +88,13 @@ export function validateObj(data: Buffer): ObjValidation {
   let triangles = 0;
   const sideHistogram: Record<string, number> = {};
   const vertices: Array<[number, number, number]> = [];
+  const objects: ObjectAccumulator[] = [];
+  let current: ObjectAccumulator | null = null;
+  const newObject = (name: string): ObjectAccumulator => {
+    const created: ObjectAccumulator = { name, vertices: 0, faces: 0, triangles: 0, triangleFaces: 0, quads: 0, ngons: 0, min: null, max: null };
+    objects.push(created);
+    return created;
+  };
   for (const rawLine of text.split(/\r?\n/u)) {
     const line = rawLine.trim();
     if (line.length === 0 || line.startsWith("#")) continue;
@@ -41,6 +102,7 @@ export function validateObj(data: Buffer): ObjValidation {
     const keyword = fields[0];
     if (keyword === "o") {
       declaredObjects += 1;
+      current = newObject(fields.slice(1).join(" "));
       continue;
     }
     if (keyword === "v") {
@@ -50,6 +112,7 @@ export function validateObj(data: Buffer): ObjValidation {
         finiteNumber(fields[2], "OBJ vertex Y"),
         finiteNumber(fields[3], "OBJ vertex Z"),
       ]);
+      if (current) current.vertices += 1;
       continue;
     }
     if (keyword === "vt") {
@@ -71,6 +134,22 @@ export function validateObj(data: Buffer): ObjValidation {
       triangles += fields.length - 3;
       const sides = String(fields.length - 1);
       sideHistogram[sides] = (sideHistogram[sides] ?? 0) + 1;
+      current ??= newObject("(unnamed)");
+      current.faces += 1;
+      current.triangles += fields.length - 3;
+      if (fields.length === 4) current.triangleFaces += 1;
+      else if (fields.length === 5) current.quads += 1;
+      else current.ngons += 1;
+      for (const reference of fields.slice(1)) {
+        const raw = Number(reference.split("/")[0]);
+        const vertex = vertices[raw > 0 ? raw - 1 : vertices.length + raw]!;
+        current.min ??= [...vertex];
+        current.max ??= [...vertex];
+        for (let axis = 0; axis < 3; axis += 1) {
+          current.min[axis] = Math.min(current.min[axis]!, vertex[axis]!);
+          current.max[axis] = Math.max(current.max[axis]!, vertex[axis]!);
+        }
+      }
     }
   }
   if (vertices.length === 0 || faces === 0) throw new Error("Plasticity produced an OBJ file without mesh vertices and faces");
@@ -94,6 +173,22 @@ export function validateObj(data: Buffer): ObjValidation {
     ngons: Object.entries(sideHistogram).reduce((sum, [sides, count]) => sum + (Number(sides) > 4 ? count : 0), 0),
     sideHistogram: Object.fromEntries(Object.entries(sideHistogram).sort((a, b) => Number(a[0]) - Number(b[0]))),
     boundsMm: { min, max, size: [max[0] - min[0], max[1] - min[1], max[2] - min[2]] },
+    ...(objects.length > 1
+      ? {
+        perObject: objects.map((object) => ({
+          name: object.name,
+          vertices: object.vertices,
+          faces: object.faces,
+          triangles: object.triangles,
+          triangleFaces: object.triangleFaces,
+          quads: object.quads,
+          ngons: object.ngons,
+          boundsMm: object.min && object.max
+            ? { min: object.min, max: object.max, size: [object.max[0] - object.min[0], object.max[1] - object.min[1], object.max[2] - object.min[2]] as [number, number, number] }
+            : null,
+        })),
+      }
+      : {}),
   };
 }
 

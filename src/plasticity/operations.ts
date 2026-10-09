@@ -96,8 +96,15 @@ import {
   requirePolySplinesSourceMeshes,
   SHADER_MODE_NAMES,
   SHADER_MODES,
+  judgePolySplinesOutcome,
+  judgeXSidedOutcome,
+  SHADER_PANEL_MIN_MODES,
   summarizeNewBodies,
+  type NewBodySummary,
   type PolySplinesOptions,
+  type PolySplinesOutcome,
+  type StudioResult,
+  type XSidedOutcome,
   type ShaderModeName,
   type ShaderModeResult,
   type XSidedEdgeInput,
@@ -368,17 +375,29 @@ const findView = `const find = id => {
 };`;
 
 /**
- * Sets a native factory field only when it exists, then reads it back. Used for fields whose names were
- * inferred from the UI rather than a prototype accessor, so a wrong guess stops the call before commit.
+ * Sets a native factory field only when it exists, then reads it back; `verifyFields` re-reads a set of fields
+ * (call it right before commit, a later setter may reset an earlier field). Read-back proves the field exists
+ * and stores the value. It cannot prove that commit uses it or what unit it is in.
  */
-const checkedFieldSetter = `const setChecked = (factory, label, name, value) => {
+const checkedFieldSetter = `const sameValue = (value, actual) => typeof value === 'number' && typeof actual === 'number'
+  ? Math.abs(actual - value) <= 1e-9 * Math.max(1, Math.abs(value))
+  : actual === value;
+const setChecked = (factory, label, name, value) => {
   if (!(name in factory)) throw new Error(label + ' has no ' + name + ' field in this Plasticity build; refusing to guess');
   factory[name] = value;
   const actual = factory[name];
-  const same = typeof value === 'number' && typeof actual === 'number'
-    ? Math.abs(actual - value) <= 1e-9 * Math.max(1, Math.abs(value))
-    : actual === value;
-  if (!same) throw new Error(label + '.' + name + ' did not accept ' + String(value) + ' (read back ' + String(actual) + ')');
+  if (!sameValue(value, actual)) throw new Error(label + '.' + name + ' did not accept ' + String(value) + ' (read back ' + String(actual) + ')');
+  return actual;
+};
+const verifyFields = (factory, label, expected) => {
+  const readBack = {};
+  for (const [name, value] of Object.entries(expected)) {
+    if (!(name in factory)) throw new Error(label + ' has no ' + name + ' field in this Plasticity build; refusing to guess');
+    const actual = factory[name];
+    if (!sameValue(value, actual)) throw new Error(label + '.' + name + ' no longer holds ' + String(value) + ' before commit (read back ' + String(actual) + '); a later setter reset it');
+    readBack[name] = actual;
+  }
+  return readBack;
 };`;
 
 const findFaceViews = `${findView}
@@ -10188,53 +10207,66 @@ export class PlasticityOperations {
   /**
    * EXPERIMENTAL. Convert reference meshes (OBJ or FBX origin) to G2 B-spline patch bodies with Plasticity's
    * PolySplines converter. `ConvertMeshToPolySplinesFactory.empties` is a confirmed accessor; the option field
-   * names (roundedCorners, mergePatches, interpolateBoundary) come from the PolySplines dialog strings and are
-   * checked to exist and to read back before commit, otherwise the call fails without creating geometry.
+   * names (roundedCorners, mergePatches, interpolateBoundary) come from the PolySplines dialog strings. The
+   * input is set first, then each option, and every field is re-read immediately before commit, so a setter
+   * that resets earlier fields is caught. Read-back proves a field exists and stores the value; it cannot prove
+   * that commit honours it. The values returned are the ones READ BACK from the factory.
    */
-  async polySplinesFromReferenceMeshes(ids: number[], options: PolySplinesOptions, revision: string): Promise<RuntimeState> {
+  async polySplinesFromReferenceMeshes(ids: number[], options: PolySplinesOptions, revision: string): Promise<StudioResult<{ readBack: Record<string, unknown>; polySplines: NewBodySummary; outcome: PolySplinesOutcome }>> {
     const state = await this.assertRevision(revision);
     requireReferenceMeshIds(state, ids);
     requirePolySplinesSourceMeshes(state, ids);
     const applied = normalizePolySplinesOptions(options);
-    await this.runtime.mutate(`async function (Factory, Command, args) {
+    const script = await this.runtime.mutate<{ readBack: Record<string, unknown> }>(`async function (Factory, Command, args) {
       if (this.executor.isBusy) throw new Error('Plasticity is busy');
       const editor = this;
       ${checkedFieldSetter}
+      const label = 'ConvertMeshToPolySplinesFactory';
       const empties = args.ids.map(id => {
         const empty = this.db.lookupEmptyById(id);
         if (empty?.constructor?.name !== 'Empties_ObjectEmpty') throw new Error('Unknown native reference mesh ID: ' + id);
         return empty;
       });
       let failure;
+      let report;
       const command = new Command(editor);
       command.remember = false;
       command.execute = async function () {
         try {
           const factory = new Factory(editor).resource(this);
-          for (const [name, value] of Object.entries(args.options)) setChecked(factory, 'ConvertMeshToPolySplinesFactory', name, value);
+          const emptiesHeld = () => Array.isArray(factory.empties) && factory.empties.length === empties.length;
+          if (!('empties' in factory)) throw new Error(label + ' has no empties field in this Plasticity build; refusing to guess');
           factory.empties = empties;
-          if (!Array.isArray(factory.empties) || factory.empties.length !== empties.length) {
-            throw new Error('ConvertMeshToPolySplinesFactory did not accept the reference meshes; refusing to commit');
-          }
-          return await factory.commit();
+          if (!emptiesHeld()) throw new Error(label + ' did not accept the reference meshes; refusing to commit');
+          for (const [name, value] of Object.entries(args.options)) setChecked(factory, label, name, value);
+          if (!emptiesHeld()) throw new Error(label + ' lost the reference meshes after the options were set; refusing to commit');
+          const readBack = verifyFields(factory, label, args.options);
+          readBack.empties = factory.empties.length;
+          const committed = await factory.commit();
+          report = { readBack, commitResultCount: Array.isArray(committed) ? committed.length : null };
+          return committed;
         } catch (error) { failure = error; throw error; }
       };
       await editor.exec(command);
       if (failure) throw failure;
+      return report ?? { readBack: {} };
     }`, ["ConvertMeshToPolySplinesFactory", "PolySplinesCommand"], [{ ids, options: applied }], LONG_NATIVE_IMPORT_TIMEOUT_MS);
     const after = await this.state(LONG_NATIVE_IMPORT_TIMEOUT_MS);
-    if (summarizeNewBodies(state, after).count === 0) {
+    const polySplines = summarizeNewBodies(state, after);
+    if (polySplines.count === 0) {
       throw new Error("PolySplines finished without creating any body; Plasticity may have rejected the mesh (the converter needs a clean quad-dominant OBJ or FBX). Inspect the document before retrying");
     }
-    return after;
+    const outcome = judgePolySplinesOutcome(after, ids, polySplines.count);
+    return { ...after, studio: { readBack: script?.readBack ?? {}, polySplines, outcome } };
   }
 
   /**
    * EXPERIMENTAL. Import an OBJ or FBX file straight to PolySplines patches through ImportPolySplinesFactory.
-   * Its input field names are inferred from the sibling import factories (`filePath`, `unit`): the script refuses
-   * to run when the factory has no `unit` field, and the call fails when no body appears.
+   * Its input field names are inferred from the sibling import factories (`filePath`, `unit`): `filePath` and
+   * `unit` must exist and read back, and every field is re-read before commit. A `unit` that exists but is
+   * ignored by commit cannot be detected by read-back (mm vs m would import at the wrong scale): verify bounds.
    */
-  async importPolySplines(inputPath: string, sourceUnit: NativeImportUnit, options: PolySplinesOptions, revision: string): Promise<RuntimeState> {
+  async importPolySplines(inputPath: string, sourceUnit: NativeImportUnit, options: PolySplinesOptions, revision: string): Promise<StudioResult<{ readBack: Record<string, unknown>; polySplines: NewBodySummary; outcome: PolySplinesOutcome }>> {
     const state = await this.assertRevision(revision);
     const input = await realpath(resolve(inputPath));
     const extension = extname(input).toLowerCase();
@@ -10243,52 +10275,65 @@ export class PlasticityOperations {
     const metadata = await stat(input);
     if (!metadata.isFile()) throw new Error("PolySplines input must be a regular file");
     if (metadata.size === 0) throw new Error("PolySplines input must not be empty");
+    if (extension === ".obj" && metadata.size > MAX_OBJ_BYTES) throw new Error("PolySplines OBJ input is excessively large");
     const applied = normalizePolySplinesOptions(options);
-    await this.runtime.mutate(`async function (Factory, Command, args) {
+    const script = await this.runtime.mutate<{ readBack: Record<string, unknown> }>(`async function (Factory, Command, args) {
       if (this.executor.isBusy) throw new Error('Plasticity is busy');
       const editor = this;
       ${checkedFieldSetter}
+      const label = 'ImportPolySplinesFactory';
       let failure;
+      let report;
       const command = new Command(editor);
       command.remember = false;
       command.execute = async function () {
         try {
           const factory = new Factory(editor).resource(this);
           if (!('unit' in factory)) {
-            throw new Error('ImportPolySplinesFactory has no unit field in this Plasticity build, so the source unit cannot be honoured; import with plasticity_import_reference_mesh and run plasticity_polysplines_from_reference_mesh instead');
+            throw new Error(label + ' has no unit field in this Plasticity build, so the source unit cannot be honoured; import with plasticity_import_reference_mesh and run plasticity_polysplines_from_reference_mesh instead');
           }
-          for (const [name, value] of Object.entries(args.options)) setChecked(factory, 'ImportPolySplinesFactory', name, value);
-          setChecked(factory, 'ImportPolySplinesFactory', 'unit', args.sourceUnit);
-          factory.filePath = args.path;
-          return await factory.commit();
+          setChecked(factory, label, 'filePath', args.path);
+          setChecked(factory, label, 'unit', args.sourceUnit);
+          for (const [name, value] of Object.entries(args.options)) setChecked(factory, label, name, value);
+          const readBack = verifyFields(factory, label, { filePath: args.path, unit: args.sourceUnit, ...args.options });
+          const committed = await factory.commit();
+          report = { readBack, commitResultCount: Array.isArray(committed) ? committed.length : null };
+          return committed;
         } catch (error) { failure = error; throw error; }
       };
       await editor.exec(command);
       if (failure) throw failure;
+      return report ?? { readBack: {} };
     }`, ["ImportPolySplinesFactory", "ImportPolySplinesCommand"], [{ path: input, sourceUnit, options: applied }], LONG_NATIVE_IMPORT_TIMEOUT_MS);
     const after = await this.state(LONG_NATIVE_IMPORT_TIMEOUT_MS);
-    if (summarizeNewBodies(state, after).count === 0) {
+    const polySplines = summarizeNewBodies(state, after);
+    if (polySplines.count === 0) {
       throw new Error("PolySplines import finished without creating any body; check the file path/unit handling with a scratch file and inspect the document before retrying");
     }
-    return after;
+    // The converter's input mesh count is unknown for a file import, so only a zero result can be judged here.
+    const outcome: PolySplinesOutcome = { partial: false, inputMeshes: 0, outputBodies: polySplines.count, sourceMeshesRemaining: [], details: "File import: the number of meshes in the file is unknown, so a partial conversion cannot be detected; compare the bounds and body count with the source" };
+    return { ...after, studio: { readBack: script?.readBack ?? {}, polySplines, outcome } };
   }
 
   /**
    * EXPERIMENTAL. N-sided (XNurbs) fill over closed boundary edges with XSidedFactory. `edges` and the base
-   * XNurbs accessors (uDegree, vDegree, uSpans, vSpans, quadSided, tolerance, continuity) are confirmed
-   * accessors; their value units and the per-edge `setContinuityForEdge(edge, ContinuityType)` convention are
-   * inferred, so every value is read back after it is set and a mismatch aborts before commit.
+   * XNurbs accessors are confirmed accessors; their value units and the per-edge `setContinuityForEdge`
+   * convention are inferred. Every value is read back after it is set and again before commit. Read-back cannot
+   * catch a unit error: `tolerance` is sent in metres and that unit is UNVERIFIED (the script refuses when the
+   * factory's default tolerance looks like millimetres). Success requires a new Sheet/Solid or an input body
+   * that gained faces, judged from the scene diff, not from the revision.
    */
-  async createXSidedSurface(edges: XSidedEdgeInput[], options: XSidedOptions, revision: string): Promise<RuntimeState> {
+  async createXSidedSurface(edges: XSidedEdgeInput[], options: XSidedOptions, revision: string): Promise<StudioResult<{ readBack: Record<string, unknown>; loopCheck: ReturnType<typeof checkClosedBoundary>; outcome: XSidedOutcome; surface: NewBodySummary }>> {
     const state = await this.assertRevision(revision);
     const normalized = normalizeXSidedOptions(edges, options);
     requireTopologySelection(state, edges.map(({ bodyId, edgeId }) => ({ bodyId, edgeId })), "edge");
-    const loop = checkClosedBoundary(state, edges);
-    await this.runtime.mutate(`async function (Factory, Command, ContinuityType, args) {
+    const loopCheck = checkClosedBoundary(state, edges);
+    const script = await this.runtime.mutate<{ readBack: Record<string, unknown> }>(`async function (Factory, Command, ContinuityType, args) {
       ${findView}
       if (this.executor.isBusy) throw new Error('Plasticity is busy');
       const editor = this;
       ${checkedFieldSetter}
+      const label = 'XSidedFactory';
       const edgeViews = args.edges.map(reference => {
         const view = find(reference.bodyId);
         if (view?.constructor?.name !== 'Solid' && view?.constructor?.name !== 'Sheet') {
@@ -10304,34 +10349,69 @@ export class PlasticityOperations {
         return value;
       };
       let failure;
+      let report;
       const command = new Command(editor);
       command.remember = false;
       command.execute = async function () {
         try {
           const factory = new Factory(editor).resource(this);
+          const edgesHeld = () => Array.isArray(factory.edges) && factory.edges.length === edgeViews.length;
+          if (!('edges' in factory)) throw new Error(label + ' has no edges field in this Plasticity build; refusing to guess');
           factory.edges = edgeViews;
-          if (!Array.isArray(factory.edges) || factory.edges.length !== edgeViews.length) {
-            throw new Error('XSidedFactory did not accept the boundary edges; refusing to commit');
+          if (!edgesHeld()) throw new Error(label + ' did not accept the boundary edges; refusing to commit');
+          const hasPerEdge = args.edges.some(reference => reference.continuity !== undefined);
+          const perEdgeApi = typeof factory.setContinuityForEdge === 'function' && factory.setContinuityForEdge.length === 2
+            && typeof factory.getContinuityForEdge === 'function';
+          if (hasPerEdge && !perEdgeApi) {
+            throw new Error(label + '.setContinuityForEdge does not have the expected (edge, continuity) signature; refusing to guess');
           }
-          for (const [name, value] of Object.entries(args.fields)) setChecked(factory, 'XSidedFactory', name, value);
-          if (args.continuity !== undefined) setChecked(factory, 'XSidedFactory', 'continuity', continuity(args.continuity));
+          const wantedFor = reference => continuity(reference.continuity ?? args.continuity);
+          if (args.fields.tolerance !== undefined) {
+            const defaultTolerance = factory.tolerance;
+            if (typeof defaultTolerance !== 'number' || !Number.isFinite(defaultTolerance)) {
+              throw new Error(label + '.tolerance default is not a number; the tolerance unit cannot be sanity checked, refusing to set it');
+            }
+            if (Math.abs(defaultTolerance) >= 0.01) {
+              throw new Error(label + '.tolerance default is ' + defaultTolerance + ', which looks like millimetres rather than metres; refusing to send a metre value');
+            }
+          }
+          for (const [name, value] of Object.entries(args.fields)) setChecked(factory, label, name, value);
+          if (args.continuity !== undefined) setChecked(factory, label, 'continuity', continuity(args.continuity));
           args.edges.forEach((reference, index) => {
             if (reference.continuity === undefined) return;
-            if (typeof factory.setContinuityForEdge !== 'function' || factory.setContinuityForEdge.length !== 2
-              || typeof factory.getContinuityForEdge !== 'function') {
-              throw new Error('XSidedFactory.setContinuityForEdge does not have the expected (edge, continuity) signature; refusing to guess');
-            }
-            const wanted = continuity(reference.continuity);
-            factory.setContinuityForEdge(edgeViews[index], wanted);
-            if (factory.getContinuityForEdge(edgeViews[index]) !== wanted) {
-              throw new Error('XSidedFactory did not apply ' + reference.continuity + ' to edge ' + reference.bodyId + ':' + reference.edgeId);
-            }
+            factory.setContinuityForEdge(edgeViews[index], continuity(reference.continuity));
           });
-          return await factory.commit();
+          const verifyEdges = () => {
+            const perEdge = [];
+            if (perEdgeApi && (args.continuity !== undefined || hasPerEdge)) {
+              args.edges.forEach((reference, index) => {
+                if (reference.continuity === undefined && args.continuity === undefined) return;
+                const wanted = wantedFor(reference);
+                const actual = factory.getContinuityForEdge(edgeViews[index]);
+                if (actual !== wanted) {
+                  throw new Error(label + ' edge ' + reference.bodyId + ':' + reference.edgeId + ' has continuity ' + String(actual) + ' instead of ' + (reference.continuity ?? args.continuity));
+                }
+                perEdge.push({ bodyId: reference.bodyId, edgeId: reference.edgeId, continuity: actual });
+              });
+            }
+            return perEdge;
+          };
+          verifyEdges();
+          // Final pass immediately before commit: a later setter may have reset an earlier field.
+          if (!edgesHeld()) throw new Error(label + ' lost the boundary edges after the options were set; refusing to commit');
+          const expected = { ...args.fields };
+          if (args.continuity !== undefined) expected.continuity = continuity(args.continuity);
+          const readBack = verifyFields(factory, label, expected);
+          readBack.edges = factory.edges.length;
+          readBack.perEdgeContinuity = verifyEdges();
+          const committed = await factory.commit();
+          report = { readBack, commitResultCount: Array.isArray(committed) ? committed.length : null };
+          return committed;
         } catch (error) { failure = error; throw error; }
       };
       await editor.exec(command);
       if (failure) throw failure;
+      return report ?? { readBack: {} };
     }`, ["XSidedFactory", "XNurbsCommand", "ContinuityType"], [{
       edges: edges.map(({ bodyId, edgeId, continuity }) => ({ bodyId, edgeId, ...(continuity !== undefined ? { continuity } : {}) })),
       continuity: normalized.continuity,
@@ -10343,68 +10423,92 @@ export class PlasticityOperations {
         ...(normalized.quadSided !== undefined ? { quadSided: normalized.quadSided } : {}),
         ...(normalized.toleranceMm !== undefined ? { tolerance: millimetersToMeters(normalized.toleranceMm) } : {}),
       },
-      loopChecked: loop.checked,
     }], LONG_NATIVE_IMPORT_TIMEOUT_MS);
     const after = await this.state(LONG_NATIVE_IMPORT_TIMEOUT_MS);
-    if (summarizeNewBodies(state, after).count === 0 && after.revision === state.revision) {
-      throw new Error("X-sided fill finished without changing the document; Plasticity may have found no solution for these boundary constraints");
-    }
-    return after;
+    const outcome = judgeXSidedOutcome(state, after, edges);
+    return { ...after, studio: { readBack: script?.readBack ?? {}, loopCheck, outcome, surface: outcome.newBodies } };
   }
 
   /**
-   * EXPERIMENTAL. Read or switch the viewport shader mode (matcaps, isophotes, draft, zebra, topo, face direction)
-   * by activating the same button in Plasticity's Shader mode panel that a user clicks. The native
-   * ViewportShading.setShader(arity 2) arguments are not readable, so the DOM control is the only verified route.
-   * This is viewport state only: it must not change the document revision, and a changed revision is reported as an error.
+   * EXPERIMENTAL. Read or switch the viewport shader mode by activating the same button in Plasticity's Shader
+   * mode panel that a user clicks. The panel root is located first (the deepest element holding at least
+   * SHADER_PANEL_MIN_MODES of the known mode thumbnails) and buttons are matched only inside it; the call
+   * refuses when no panel is mounted, when several panels qualify, or when a mode matches more than one button.
+   * Exactly one click is sent, then the active mode is polled and read back. Viewport state only: it uses
+   * runtime.read, so it bypasses the `uncertain` mutation guard, and a changed document revision is an error.
    */
   async shaderMode(mode: ShaderModeName | undefined): Promise<ShaderModeResult> {
     if (mode !== undefined && !(mode in SHADER_MODES)) throw new Error(`Unknown shader mode ${String(mode)}; use one of ${SHADER_MODE_NAMES.join(", ")}`);
     const before = await this.state();
     const byImage: Record<string, string> = {};
     for (const [name, entry] of Object.entries(SHADER_MODES)) byImage[entry.image] = name;
-    const outcome = await this.runtime.read<{ previous: string | null; current: string | null; available: string[] }>(`async function (args) {
-      const scan = () => {
-        const entries = new Map();
-        for (const img of document.querySelectorAll('button img')) {
-          const src = (img.getAttribute('src') || '').split('?')[0];
-          const image = src.slice(src.lastIndexOf('/') + 1).replace(/[.]png$/i, '');
-          const name = args.byImage[image];
-          const button = img.closest('button');
-          if (name && button && !entries.has(name)) entries.set(name, button);
-        }
-        return entries;
-      };
-      const activeOf = entries => {
-        const active = [...entries].filter(([, button]) => button.getAttribute('data-state') === 'active').map(([name]) => name);
-        return active.length === 1 ? active[0] : null;
-      };
-      const settle = () => new Promise(resolve => setTimeout(resolve, 150));
-      let entries = scan();
-      if (entries.size === 0) {
-        throw new Error('Plasticity Shader mode panel is not mounted (no matcap buttons found); open the viewport settings sidebar and retry');
-      }
-      const previous = activeOf(entries);
-      if (args.mode !== undefined && previous !== args.mode) {
-        const button = entries.get(args.mode);
-        if (!button) throw new Error('Shader mode button is unavailable: ' + args.mode);
-        button.click();
-        await settle();
-        if (activeOf(scan()) !== args.mode) {
-          for (const type of ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click']) {
-            const Ctor = type.startsWith('pointer') ? PointerEvent : MouseEvent;
-            button.dispatchEvent(new Ctor(type, { bubbles: true, cancelable: true, view: window }));
+    const revisionNote = async (message: string): Promise<Error> => {
+      const afterError = await this.state().catch(() => null);
+      return new Error(afterError && afterError.revision !== before.revision
+        ? `${message}; ALSO the document revision changed (${before.revision} -> ${afterError.revision}), inspect plasticity_changes_since and Undo history`
+        : message);
+    };
+    let outcome: { previous: string | null; current: string | null; available: string[]; panelButtons: number };
+    try {
+      outcome = await this.runtime.read<typeof outcome>(`async function (args) {
+        if (this.executor.isBusy) throw new Error('Plasticity is busy');
+        const wait = ms => new Promise(resolve => setTimeout(resolve, ms));
+        const scan = () => {
+          const matches = [];
+          for (const img of document.querySelectorAll('button img')) {
+            const src = (img.getAttribute('src') || '').split('?')[0];
+            const image = src.slice(src.lastIndexOf('/') + 1).replace(/[.]png$/i, '');
+            const name = args.byImage[image];
+            const button = img.closest('button');
+            if (name && button) matches.push({ name, button });
           }
-          await settle();
+          const notMounted = 'Plasticity Shader mode panel is not mounted (fewer than ' + args.minModes + ' mode buttons share one container); open the viewport settings sidebar and retry';
+          if (matches.length === 0) throw new Error(notMounted);
+          const groups = new Map();
+          for (const { name, button } of matches) {
+            for (let element = button.parentElement; element; element = element.parentElement) {
+              if (!groups.has(element)) groups.set(element, new Set());
+              groups.get(element).add(name);
+            }
+          }
+          const candidates = [...groups].filter(([, names]) => names.size >= args.minModes).map(([element]) => element);
+          const roots = candidates.filter(element => !candidates.some(other => other !== element && element.contains(other)));
+          if (roots.length === 0) throw new Error(notMounted);
+          if (roots.length > 1) throw new Error('More than one container holds Shader mode buttons (' + roots.length + '); refusing to guess which is the Shader mode panel');
+          const entries = new Map();
+          for (const { name, button } of matches) {
+            if (!roots[0].contains(button)) continue;
+            if (entries.has(name) && entries.get(name) !== button) throw new Error('Shader mode ' + name + ' matches more than one button in the panel; refusing to guess');
+            entries.set(name, button);
+          }
+          return entries;
+        };
+        const activeOf = entries => {
+          const active = [...entries].filter(([, button]) => button.getAttribute('data-state') === 'active').map(([name]) => name);
+          return active.length === 1 ? active[0] : null;
+        };
+        let entries = scan();
+        const previous = activeOf(entries);
+        if (args.mode !== undefined && previous !== args.mode) {
+          const button = entries.get(args.mode);
+          if (!button) throw new Error('Shader mode button is unavailable in the panel: ' + args.mode);
+          button.click();
+          for (let attempt = 0; attempt < 10; attempt += 1) {
+            await wait(100);
+            entries = scan();
+            if (activeOf(entries) === args.mode) break;
+          }
+          const current = activeOf(entries);
+          if (current !== args.mode) {
+            throw new Error('Plasticity did not activate shader mode ' + args.mode + ' after one click (active mode read back: ' + current + '); no second click was sent');
+          }
+          for (const viewport of this.viewports ?? []) viewport.setNeedsRender?.();
         }
-        entries = scan();
-        if (activeOf(entries) !== args.mode) {
-          throw new Error('Plasticity did not activate shader mode ' + args.mode + '; the panel button click had no effect');
-        }
-        for (const viewport of this.viewports) viewport.setNeedsRender?.();
-      }
-      return { previous, current: activeOf(entries), available: [...entries.keys()] };
-    }`, [{ byImage, mode }]);
+        return { previous, current: activeOf(entries), available: [...entries.keys()], panelButtons: entries.size };
+      }`, [{ byImage, mode, minModes: SHADER_PANEL_MIN_MODES }]);
+    } catch (error) {
+      throw await revisionNote(error instanceof Error ? error.message : String(error));
+    }
     const after = await this.state();
     if (after.revision !== before.revision) {
       throw new Error(`Shader mode ${mode ?? "(read)"} changed the document revision (${before.revision} -> ${after.revision}); this is viewport state and should not. Inspect plasticity_changes_since and Undo history before continuing`);
@@ -10412,8 +10516,10 @@ export class PlasticityOperations {
     return {
       previous: outcome.previous as ShaderModeName | null,
       current: outcome.current as ShaderModeName | null,
+      requested: mode ?? null,
       changed: outcome.previous !== outcome.current,
       available: outcome.available as ShaderModeName[],
+      panelButtons: outcome.panelButtons,
       revisionBefore: before.revision,
       revisionAfter: after.revision,
     };

@@ -13,6 +13,8 @@ const newSheet = {
   id: 9, versionId: 109, type: "Sheet", name: "patch", boundsMm: { min: [0, 0, 0] as [number, number, number], max: [40, 20, 10] as [number, number, number] },
   faceIds: ["f1", "f2"], edgeIds: ["e1"], faces: [], edges: [], vertices: [],
 };
+const summary = (count: number) => ({ count, closedSolids: 0, sheets: count, totalFaces: 2 * count, bodies: count ? [{ id: 9, type: "Sheet", name: "patch", closure: "sheet", closed: false, faceCount: 2, edgeCount: 1, boundsMm: newSheet.boundsMm, sizeMm: [40, 20, 10] }] : [] });
+const polyStudio = (partial = false) => ({ readBack: { mergePatches: false }, polySplines: summary(1), outcome: { partial, inputMeshes: 1, outputBodies: 1, sourceMeshesRemaining: [], details: partial ? "PARTIAL" : null } });
 const stateWith = (bodies: RuntimeState["bodies"], revision: string): RuntimeState => ({
   targetId: "w", title: "t", documentToken: "d", revision, dbVersion: 1, undoDepth: 0, redoDepth: 0, regions: [], construction, bodies,
 });
@@ -41,8 +43,8 @@ test("PolySplines tools forward only the given options and report new bodies", a
   let calls = 0;
   const operations = {
     async state() { calls += 1; return calls % 2 === 1 ? stateWith([], "r1") : stateWith([newSheet], "r2"); },
-    async polySplinesFromReferenceMeshes(...args: unknown[]) { received.convert = args; return stateWith([newSheet], "r2"); },
-    async importPolySplines(...args: unknown[]) { received.import = args; return stateWith([newSheet], "r2"); },
+    async polySplinesFromReferenceMeshes(...args: unknown[]) { received.convert = args; return { ...stateWith([newSheet], "r2"), studio: polyStudio() }; },
+    async importPolySplines(...args: unknown[]) { received.import = args; return { ...stateWith([newSheet], "r2"), studio: polyStudio() }; },
   };
   await withTools(operations, async (client) => {
     const converted = await client.callTool({ name: "plasticity_polysplines_from_reference_mesh", arguments: { referenceMeshIds: [4, 5], mergePatches: false, revision: "r1" } });
@@ -50,6 +52,8 @@ test("PolySplines tools forward only the given options and report new bodies", a
     assert.deepEqual(received.convert, [[4, 5], { mergePatches: false }, "r1"]);
     const body = parse(converted);
     assert.equal(body.experimental, true);
+    assert.equal(body.partial, false);
+    assert.deepEqual(body.appliedOptions, { mergePatches: false });
     const summary = body.polySplines as { count: number; sheets: number; bodies: Array<{ id: number; faceCount: number; closure: string; sizeMm: number[] }> };
     assert.equal(summary.count, 1);
     assert.equal(summary.sheets, 1);
@@ -96,7 +100,7 @@ test("X-sided surface tool validates edges and ranges and forwards options", asy
   let calls = 0;
   const operations = {
     async state() { calls += 1; return calls % 2 === 1 ? stateWith([], "r1") : stateWith([newSheet], "r2"); },
-    async createXSidedSurface(...args: unknown[]) { received = args; return stateWith([newSheet], "r2"); },
+    async createXSidedSurface(...args: unknown[]) { received = args; return { ...stateWith([newSheet], "r2"), studio: { readBack: {}, loopCheck: { checked: true, loops: 1, toleranceMm: 0.01 }, outcome: { kind: "created", newBodies: summary(1), extendedBodies: [], revisionChanged: true }, surface: summary(1) } }; },
   };
   const edges = [1, 2, 3, 4].map((n) => ({ bodyId: 1, edgeId: `e${n}` }));
   await withTools(operations, async (client) => {

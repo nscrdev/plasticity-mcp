@@ -893,9 +893,10 @@ Plasticity step in one history entry. On the accepted 26.1.3 surface it changed
 degree 3/3 to 4/4, spans 3/2 to 5/3, control points 6×5 to 9×7, and altered an
 exact bound by 1.685846 mm. Treat it as a shape-changing rebuild and verify all
 functional geometry afterward.
+
 ### Studio surfacing (experimental)
 
-`plasticity_polysplines_from_reference_mesh`, `plasticity_import_polysplines`, `plasticity_create_xsided_surface` and `plasticity_set_shader_mode` drive Plasticity Studio features. Their native field names are inferred and each is verified (exists, reads back equal) before commit; an error naming a missing field means the guess was wrong. Shader mode clicks the Shader panel buttons and leaves the undo stack and revision untouched. See the changelog for ranges.
+`plasticity_polysplines_from_reference_mesh`, `plasticity_import_polysplines`, `plasticity_create_xsided_surface` and `plasticity_set_shader_mode` drive Plasticity Studio features. Their native field names are inferred; each field must exist and store the value, and is re-read right before commit, and the values read back are returned. Read-back cannot detect unit errors (the X-sided tolerance in metres, the PolySplines import unit) or a field that commit ignores: check the returned bounds and surfaces. PolySplines reports `partial: true` when fewer bodies than meshes appear; X-sided succeeds only when a new surface appears or an input body gains faces. Shader mode finds the Shader panel container, sends one click, reads the active mode back and leaves the undo stack and revision untouched. See the changelog for ranges.
 
 `plasticity_rebuild_face` refits one exact current Solid or Sheet face into a
 native B-Surface using projected boundary edges and an explicit positive

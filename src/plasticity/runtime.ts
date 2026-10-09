@@ -85,7 +85,7 @@ export interface RuntimeState {
     type: "ReferenceMesh";
     name: string | null;
     sourcePath: string;
-    sourceFormat: "stl" | "obj" | "3mf" | "unknown";
+    sourceFormat: "stl" | "obj" | "3mf" | "fbx" | "unknown";
     measurementSource: "reference-mesh";
     boundsMm: { min: [number, number, number]; max: [number, number, number] } | null;
     translationMm: [number, number, number];
@@ -661,7 +661,7 @@ export class PlasticityRuntime {
         if (stable?.constructor?.name !== 'Empties_ObjectEmpty') return null;
         const sourcePath = String(info.path ?? '');
         const lowerPath = sourcePath.toLowerCase();
-        const sourceFormat = lowerPath.endsWith('.stl') ? 'stl' : lowerPath.endsWith('.obj') ? 'obj' : lowerPath.endsWith('.3mf') ? '3mf' : 'unknown';
+        const sourceFormat = lowerPath.endsWith('.stl') ? 'stl' : lowerPath.endsWith('.obj') ? 'obj' : lowerPath.endsWith('.3mf') ? '3mf' : lowerPath.endsWith('.fbx') ? 'fbx' : 'unknown';
         const localBox = stable.boundingBox?.clone?.();
         const worldBox = localBox?.applyMatrix4?.(stable.matrixWorld);
         const position = new Vector();

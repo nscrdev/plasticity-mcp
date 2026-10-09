@@ -1,3 +1,4 @@
+import { diffScenes } from "./change-tracker.ts";
 import type { RuntimeState } from "./runtime.ts";
 
 type Vector3 = [number, number, number];
@@ -91,8 +92,9 @@ export function requirePolySplinesSourceMeshes(state: RuntimeState, ids: number[
   for (const id of ids) {
     const mesh = meshes.find((candidate) => candidate.id === id);
     if (!mesh) throw new Error(`Unknown current reference mesh ID: ${id}`);
-    if (mesh.sourceFormat === "stl" || mesh.sourceFormat === "3mf") {
-      throw new Error(`Reference mesh ${id} came from a ${mesh.sourceFormat.toUpperCase()} file; PolySplines supports OBJ and FBX meshes only. Re-import the source as OBJ with plasticity_import_reference_mesh.`);
+    if (mesh.sourceFormat !== "obj" && mesh.sourceFormat !== "fbx") {
+      const origin = mesh.sourceFormat === "unknown" ? "an unrecognised or unknown source" : `a ${mesh.sourceFormat.toUpperCase()} file`;
+      throw new Error(`Reference mesh ${id} came from ${origin}; PolySplines supports OBJ and FBX meshes only. Re-import the source as OBJ with plasticity_import_reference_mesh.`);
     }
   }
 }
@@ -155,36 +157,105 @@ export function normalizeXSidedOptions(edges: XSidedEdgeInput[], options: XSided
 }
 
 /**
- * Checks that the supplied edges chain into closed loops using vertex positions from the scene snapshot
- * (every endpoint cluster must be shared by exactly two edge ends). Returns a note instead of failing when
- * vertex positions are not available so a missing field never blocks a valid fill.
+ * Checks that the supplied edges chain into ONE closed loop using vertex positions from the scene snapshot:
+ * every endpoint cluster must be shared by exactly two edge ends and all edges must be one connected component.
+ * The check is mandatory: when vertex positions are unavailable it refuses instead of skipping silently.
+ * The endpoint tolerance is a fixed 0.01 mm, which suits B-rep vertices.
  */
-export function checkClosedBoundary(state: RuntimeState, edges: Array<{ bodyId: number; edgeId: string }>, toleranceMm = 0.01): { checked: boolean; note?: string } {
-  const ends: Vector3[] = [];
+export function checkClosedBoundary(state: RuntimeState, edges: Array<{ bodyId: number; edgeId: string }>, toleranceMm = 0.01): { checked: true; loops: number; toleranceMm: number } {
+  const unavailable = (reference: { bodyId: number; edgeId: string }) => new Error(`Cannot verify that the boundary edges form a closed loop: vertex positions are unavailable for edge ${reference.bodyId}:${reference.edgeId}. Refusing to run an unchecked X-sided fill; capture a fresh snapshot and retry`);
+  const clusters: Array<{ position: Vector3; count: number }> = [];
+  const clusterOf = (end: Vector3): number => {
+    const index = clusters.findIndex((cluster) => Math.hypot(cluster.position[0] - end[0], cluster.position[1] - end[1], cluster.position[2] - end[2]) <= toleranceMm);
+    if (index >= 0) { clusters[index]!.count += 1; return index; }
+    clusters.push({ position: end, count: 1 });
+    return clusters.length - 1;
+  };
+  const pairs: Array<[number, number]> = [];
   for (const reference of edges) {
     const body = state.bodies.find((candidate) => candidate.id === reference.bodyId);
     const edge = body?.edges.find((candidate) => candidate.id === reference.edgeId);
     if (!body || !edge) throw new Error(`Unknown current edge ${reference.bodyId}:${reference.edgeId}`);
     if (body.type !== "Solid" && body.type !== "Sheet") throw new Error(`Edge ${reference.bodyId}:${reference.edgeId} must belong to a Solid or Sheet`);
     const vertexIds = edge.vertexIds.length === 1 ? [edge.vertexIds[0]!, edge.vertexIds[0]!] : edge.vertexIds;
-    if (vertexIds.length !== 2 || !body.vertices) return { checked: false, note: "vertex positions unavailable; closed-loop check skipped" };
-    for (const vertexId of vertexIds) {
-      const vertex = body.vertices.find((candidate) => candidate.id === vertexId);
-      if (!vertex) return { checked: false, note: "vertex positions unavailable; closed-loop check skipped" };
-      ends.push(vertex.positionMm);
-    }
-  }
-  const clusters: Array<{ position: Vector3; count: number }> = [];
-  for (const end of ends) {
-    const found = clusters.find((cluster) => Math.hypot(cluster.position[0] - end[0], cluster.position[1] - end[1], cluster.position[2] - end[2]) <= toleranceMm);
-    if (found) found.count += 1;
-    else clusters.push({ position: end, count: 1 });
+    if (vertexIds.length !== 2 || !body.vertices) throw unavailable(reference);
+    const indices = vertexIds.map((vertexId) => {
+      const vertex = body.vertices!.find((candidate) => candidate.id === vertexId);
+      if (!vertex) throw unavailable(reference);
+      return clusterOf(vertex.positionMm);
+    });
+    pairs.push([indices[0]!, indices[1]!]);
   }
   const open = clusters.filter((cluster) => cluster.count !== 2);
   if (open.length > 0) {
     throw new Error(`Boundary edges do not form a closed loop: ${open.length} endpoint(s) are shared by ${open.map((cluster) => cluster.count).join(", ")} edge end(s) instead of exactly two (first at ${open[0]!.position.map(round6).join(", ")} mm)`);
   }
-  return { checked: true };
+  const parent = clusters.map((_, index) => index);
+  const find = (index: number): number => (parent[index] === index ? index : (parent[index] = find(parent[index]!)));
+  for (const [a, b] of pairs) parent[find(a)] = find(b);
+  const loops = new Set(clusters.map((_, index) => find(index))).size;
+  if (loops !== 1) throw new Error(`Boundary edges form ${loops} separate loops; X-sided fill needs exactly one closed loop`);
+  return { checked: true, loops, toleranceMm };
+}
+
+export interface XSidedOutcome {
+  /** "created" = at least one new Sheet or Solid; "extended" = an owning body gained faces. */
+  kind: "created" | "extended";
+  newBodies: NewBodySummary;
+  extendedBodies: Array<{ id: number; faceCountBefore: number; faceCountAfter: number; versionChanged: boolean }>;
+  revisionChanged: boolean;
+}
+
+/**
+ * Judges an X-sided commit from the scene diff, not from the revision (which also moves on any history
+ * entry). Success needs a new Sheet or Solid, or an input edge's owner body whose version changed and whose
+ * face count grew. Anything else is thrown with what did change.
+ */
+export function judgeXSidedOutcome(before: RuntimeState, after: RuntimeState, edges: Array<{ bodyId: number }>): XSidedOutcome {
+  const diff = diffScenes(before, after);
+  const newBodies = summarizeNewBodies(before, after);
+  const newSurfaces = newBodies.bodies.filter((body) => body.type === "Sheet" || body.type === "Solid");
+  const owners = new Set(edges.map((edge) => edge.bodyId));
+  const extendedBodies = diff.modified
+    .filter((entry) => owners.has(entry.id) && entry.after.versionId !== entry.before.versionId && entry.after.faceIds.length > entry.before.faceIds.length)
+    .map((entry) => ({ id: entry.id, faceCountBefore: entry.before.faceIds.length, faceCountAfter: entry.after.faceIds.length, versionChanged: true }));
+  const revisionChanged = after.revision !== before.revision;
+  if (newSurfaces.length > 0) return { kind: "created", newBodies, extendedBodies, revisionChanged };
+  if (extendedBodies.length > 0) return { kind: "extended", newBodies, extendedBodies, revisionChanged };
+  const changed = [
+    `revision ${revisionChanged ? `${before.revision} -> ${after.revision}` : "unchanged"}`,
+    `undo depth ${before.undoDepth} -> ${after.undoDepth}`,
+    `new bodies ${newBodies.count} (${newBodies.bodies.map((body) => `${body.id}:${body.type}`).join(", ") || "none"})`,
+    `modified bodies ${diff.modified.map((entry) => entry.id).join(", ") || "none"}`,
+    `removed bodies ${diff.removed.map((body) => body.id).join(", ") || "none"}`,
+  ].join("; ");
+  throw new Error(`X-sided fill did not create or extend a surface (${changed}). If undo depth rose, Plasticity pushed an empty history entry: inspect and Undo it`);
+}
+
+export interface PolySplinesOutcome {
+  /** True when fewer output bodies than input meshes appeared. */
+  partial: boolean;
+  inputMeshes: number;
+  outputBodies: number;
+  /** Source meshes that no longer exist after the conversion (consumed or hidden by the converter). */
+  sourceMeshesRemaining: number[];
+  details: string | null;
+}
+
+/** Compares output bodies with input meshes so a partial conversion is never reported as a clean success. */
+export function judgePolySplinesOutcome(after: RuntimeState, meshIds: number[], newBodyCount: number): PolySplinesOutcome {
+  const remaining = new Set((after.referenceMeshes ?? []).map((mesh) => mesh.id));
+  const sourceMeshesRemaining = meshIds.filter((id) => remaining.has(id));
+  const partial = newBodyCount < meshIds.length;
+  return {
+    partial,
+    inputMeshes: meshIds.length,
+    outputBodies: newBodyCount,
+    sourceMeshesRemaining,
+    details: partial
+      ? `PARTIAL: ${newBodyCount} body(ies) from ${meshIds.length} input mesh(es); the converter may have skipped meshes with creases or non-quad topology. Inspect the result before relying on it`
+      : null,
+  };
 }
 
 /**
@@ -211,7 +282,17 @@ export const SHADER_MODES = {
 export type ShaderModeName = keyof typeof SHADER_MODES;
 export const SHADER_MODE_NAMES = Object.keys(SHADER_MODES) as [ShaderModeName, ...ShaderModeName[]];
 
+/** Minimum number of known mode thumbnails that must share one container for it to count as the Shader mode panel. */
+export const SHADER_PANEL_MIN_MODES = 10;
+
+/** A mutation result: the post-commit scene plus the Studio tool's own report. */
+export type StudioResult<T> = RuntimeState & { studio: T };
+
 export interface ShaderModeResult {
+  /** Mode the caller asked for, or null for a pure read. */
+  requested: ShaderModeName | null;
+  /** Number of panel buttons matched inside the Shader mode panel. */
+  panelButtons: number;
   /** Mode that was active before the call, or null when it is a custom matcap or unrecognised. */
   previous: ShaderModeName | null;
   /** Mode active after the call. */

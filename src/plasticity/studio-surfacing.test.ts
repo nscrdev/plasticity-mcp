@@ -4,6 +4,8 @@ import { test } from "node:test";
 import type { RuntimeState } from "./runtime.ts";
 import {
   checkClosedBoundary,
+  judgePolySplinesOutcome,
+  judgeXSidedOutcome,
   normalizePolySplinesOptions,
   normalizeXSidedOptions,
   requirePolySplinesSourceMeshes,
@@ -21,7 +23,7 @@ const state = (bodies: RuntimeState["bodies"], referenceMeshes: RuntimeState["re
   targetId: "w", title: "t", documentToken: "d", revision: "r", dbVersion: 1, undoDepth: 0, redoDepth: 0,
   regions: [], construction, bodies, referenceMeshes,
 });
-const mesh = (id: number, sourceFormat: "stl" | "obj" | "3mf" | "unknown") => ({
+const mesh = (id: number, sourceFormat: "stl" | "obj" | "3mf" | "fbx" | "unknown") => ({
   id, type: "ReferenceMesh" as const, name: "m", sourcePath: `/tmp/m.${sourceFormat}`, sourceFormat, measurementSource: "reference-mesh" as const,
   boundsMm: null, translationMm: [0, 0, 0] as [number, number, number], rotationQuaternion: [0, 0, 0, 1] as [number, number, number, number],
   sceneScaleToMeters: [1, 1, 1] as [number, number, number], vertexEntries: 0, triangles: 0, visible: true, hidden: false, locked: false,
@@ -47,8 +49,9 @@ test("PolySplines options are forwarded only when set and must be booleans", () 
 });
 
 test("PolySplines refuses STL and 3MF reference meshes and unknown IDs", () => {
-  const scene = state([], [mesh(1, "obj"), mesh(2, "stl"), mesh(3, "3mf"), mesh(4, "unknown")]);
-  requirePolySplinesSourceMeshes(scene, [1, 4]);
+  const scene = state([], [mesh(1, "obj"), mesh(2, "stl"), mesh(3, "3mf"), mesh(4, "unknown"), mesh(5, "fbx")]);
+  requirePolySplinesSourceMeshes(scene, [1, 5]);
+  assert.throws(() => requirePolySplinesSourceMeshes(scene, [4]), /unknown source/u);
   assert.throws(() => requirePolySplinesSourceMeshes(scene, [2]), /OBJ and FBX meshes only/u);
   assert.throws(() => requirePolySplinesSourceMeshes(scene, [3]), /3MF/u);
   assert.throws(() => requirePolySplinesSourceMeshes(scene, [9]), /Unknown current reference mesh ID: 9/u);
@@ -83,16 +86,19 @@ test("checkClosedBoundary accepts a closed loop and names the open endpoint othe
   const positions: Array<[number, number, number]> = [[0, 0, 0], [10, 0, 0], [10, 10, 0], [0, 10, 0]];
   const closed = state([loopBody(1, positions, [[1, 2], [2, 3], [3, 4], [4, 1]])]);
   const refs = (count: number) => Array.from({ length: count }, (_, index) => ({ bodyId: 1, edgeId: `e${index}` }));
-  assert.deepEqual(checkClosedBoundary(closed, refs(4)), { checked: true });
+  assert.deepEqual(checkClosedBoundary(closed, refs(4)), { checked: true, loops: 1, toleranceMm: 0.01 });
   assert.throws(() => checkClosedBoundary(closed, refs(3)), /do not form a closed loop.*0, 10, 0 mm|do not form a closed loop/u);
   const { vertices: _dropped, ...noVertices } = loopBody(1, positions, [[1, 2], [2, 3], [3, 4], [4, 1]]);
   const missing = state([noVertices]);
-  assert.equal(checkClosedBoundary(missing, refs(4)).checked, false);
+  assert.throws(() => checkClosedBoundary(missing, refs(4)), /Cannot verify.*closed loop/u);
+  const eight: Array<[number, number, number]> = [[0, 0, 0], [1, 0, 0], [1, 1, 0], [50, 0, 0], [51, 0, 0], [51, 1, 0]];
+  const twoLoops = state([loopBody(4, eight, [[1, 2], [2, 3], [3, 1], [4, 5], [5, 6], [6, 4]])]);
+  assert.throws(() => checkClosedBoundary(twoLoops, Array.from({ length: 6 }, (_, index) => ({ bodyId: 4, edgeId: `e${index}` }))), /2 separate loops/u);
   assert.throws(() => checkClosedBoundary(closed, [{ bodyId: 1, edgeId: "nope" }]), /Unknown current edge/u);
   const wire = state([{ ...loopBody(2, positions, [[1, 2]]), type: "Wire" }]);
   assert.throws(() => checkClosedBoundary(wire, [{ bodyId: 2, edgeId: "e0" }]), /Solid or Sheet/u);
   const single = state([loopBody(3, [[0, 0, 0]], [[1]])]);
-  assert.deepEqual(checkClosedBoundary(single, [{ bodyId: 3, edgeId: "e0" }]), { checked: true });
+  assert.equal(checkClosedBoundary(single, [{ bodyId: 3, edgeId: "e0" }]).checked, true);
 });
 
 test("shader modes map to the panel thumbnail names read from Plasticity 26.1.3", () => {
@@ -102,4 +108,26 @@ test("shader modes map to the panel thumbnail names read from Plasticity 26.1.3"
   assert.equal(shaderModeForImage("face-direction"), "face_direction");
   assert.equal(shaderModeForImage("isophotes"), "isophotes");
   assert.equal(shaderModeForImage("custom_matcap"), null);
+});
+
+test("judgeXSidedOutcome needs a new surface or a grown owner body, not just a revision change", () => {
+  const before = state([body(1, "Sheet")]);
+  const created = judgeXSidedOutcome(before, { ...state([body(1, "Sheet"), body(2, "Sheet")]), revision: "r2" }, [{ bodyId: 1 }]);
+  assert.equal(created.kind, "created");
+  const extended = judgeXSidedOutcome(before, { ...state([body(1, "Sheet", { versionId: 999, faceIds: ["f1", "f2", "f3", "f4"] })]), revision: "r2" }, [{ bodyId: 1 }]);
+  assert.equal(extended.kind, "extended");
+  assert.deepEqual(extended.extendedBodies, [{ id: 1, faceCountBefore: 3, faceCountAfter: 4, versionChanged: true }]);
+  const historyOnly = { ...state([body(1, "Sheet")]), revision: "r2", undoDepth: 1 };
+  assert.throws(() => judgeXSidedOutcome(before, historyOnly, [{ bodyId: 1 }]), /did not create or extend a surface.*undo depth 0 -> 1/u);
+  assert.throws(() => judgeXSidedOutcome(before, { ...state([body(1, "Sheet"), body(3, "Wire")]), revision: "r2" }, [{ bodyId: 1 }]), /did not create or extend/u);
+});
+
+test("judgePolySplinesOutcome flags fewer output bodies than input meshes as partial", () => {
+  const after = state([], [mesh(4, "obj")]);
+  const full = judgePolySplinesOutcome(after, [4, 5], 2);
+  assert.equal(full.partial, false);
+  const partial = judgePolySplinesOutcome(after, [4, 5], 1);
+  assert.equal(partial.partial, true);
+  assert.deepEqual(partial.sourceMeshesRemaining, [4]);
+  assert.match(partial.details ?? "", /PARTIAL/u);
 });

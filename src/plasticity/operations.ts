@@ -422,6 +422,14 @@ const commandEnd = `
   await this.exec(command);
   if (failure) throw failure;`;
 
+export interface ObjMeshOptions {
+  maxSides?: number;
+  convex?: boolean;
+  density?: number;
+  maxWidthMm?: number;
+  curveChordMaxMm?: number;
+}
+
 export class PlasticityOperations {
   readonly runtime: PlasticityRuntime;
   readonly datumRegistry: DatumRegistry;
@@ -8673,7 +8681,9 @@ export class PlasticityOperations {
     revision: string,
     chordToleranceMm: number,
     angleToleranceDegrees: number,
+    meshOptions: ObjMeshOptions = {},
   ): Promise<ObjValidation & {
+    meshOptions: ObjMeshOptions & { maxSides: number };
     path: string;
     bytes: number;
     sourceUnits: "millimeter";
@@ -8685,6 +8695,12 @@ export class PlasticityOperations {
     requireMeshExportBodies(state, ids, "OBJ");
     if (!Number.isFinite(chordToleranceMm) || chordToleranceMm <= 0) throw new Error("OBJ chord tolerance must be a positive finite millimeter value");
     if (!Number.isFinite(angleToleranceDegrees) || angleToleranceDegrees <= 0 || angleToleranceDegrees > 90) throw new Error("OBJ angle tolerance must be within (0, 90] degrees");
+    const { maxSides, convex, density, maxWidthMm, curveChordMaxMm } = meshOptions;
+    if (maxSides !== undefined && (!Number.isInteger(maxSides) || maxSides < 3 || maxSides > 64)) throw new Error("OBJ maxSides must be an integer within 3..64");
+    if (convex !== undefined && typeof convex !== "boolean") throw new Error("OBJ convex must be a boolean");
+    if (density !== undefined && (!Number.isFinite(density) || density < 0 || density > 1)) throw new Error("OBJ density must be a finite number within 0..1");
+    if (maxWidthMm !== undefined && (!Number.isFinite(maxWidthMm) || maxWidthMm < 0)) throw new Error("OBJ maxWidthMm must be a finite millimeter value >= 0");
+    if (curveChordMaxMm !== undefined && (!Number.isFinite(curveChordMaxMm) || curveChordMaxMm < 0)) throw new Error("OBJ curveChordMaxMm must be a finite millimeter value >= 0");
     const output = resolve(outputPath);
     if (extname(output).toLowerCase() !== ".obj") throw new Error("OBJ output must end in .obj");
     await assertAbsent(output);
@@ -8707,12 +8723,22 @@ export class PlasticityOperations {
         factory.surfacePlaneTolerance = args.chordTolerance;
         factory.curveChordAngleDegrees = args.angleToleranceDegrees;
         factory.surfacePlaneAngleDegrees = args.angleToleranceDegrees;
+        if (args.maxSides !== undefined) factory.maxSides = args.maxSides;
+        if (args.convex !== undefined) factory.convex = args.convex;
+        if (args.density !== undefined) factory.density = args.density;
+        if (args.maxWidth !== undefined) factory.maxWidth = args.maxWidth;
+        if (args.curveChordMax !== undefined) factory.curveChordMax = args.curveChordMax;
         await factory.commit();
       }`, ["OBJExportFactory"], [{
         ids,
         path: temporary,
         chordTolerance: millimetersToMeters(chordToleranceMm),
         angleToleranceDegrees,
+        ...(maxSides !== undefined ? { maxSides } : {}),
+        ...(convex !== undefined ? { convex } : {}),
+        ...(density !== undefined ? { density } : {}),
+        ...(maxWidthMm !== undefined ? { maxWidth: millimetersToMeters(maxWidthMm) } : {}),
+        ...(curveChordMaxMm !== undefined ? { curveChordMax: millimetersToMeters(curveChordMaxMm) } : {}),
       }]);
       const temporarySize = (await stat(temporary)).size;
       if (temporarySize === 0 || temporarySize > MAX_OBJ_BYTES) throw new Error("Plasticity produced an empty or excessively large OBJ file");
@@ -8727,6 +8753,7 @@ export class PlasticityOperations {
         ...validation,
         chordToleranceMm,
         angleToleranceDegrees,
+        meshOptions: { maxSides: maxSides ?? 3, ...(convex !== undefined ? { convex } : {}), ...(density !== undefined ? { density } : {}), ...(maxWidthMm !== undefined ? { maxWidthMm } : {}), ...(curveChordMaxMm !== undefined ? { curveChordMaxMm } : {}) },
       };
     } finally {
       if (!this.runtime.isUncertain()) {

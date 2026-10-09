@@ -1555,7 +1555,16 @@ test("MCP validates and forwards native OBJ export parameters", async () => {
       ids: [7], path: "/tmp/part.obj", chordToleranceMm: 0.08, angleToleranceDegrees: 12, revision: "r1",
     } });
     assert.equal(response.isError, undefined);
-    assert.deepEqual(received, [[7], "/tmp/part.obj", "r1", 0.08, 12]);
+    assert.deepEqual(received, [[7], "/tmp/part.obj", "r1", 0.08, 12, {}]);
+    const quad = await client.callTool({ name: "plasticity_export_obj", arguments: {
+      ids: [7], path: "/tmp/part.obj", maxSides: 4, convex: false, density: 0.5, maxWidthMm: 0, curveChordMaxMm: 0.1, revision: "r1",
+    } });
+    assert.equal(quad.isError, undefined);
+    assert.deepEqual(received, [[7], "/tmp/part.obj", "r1", 0.05, 15, { maxSides: 4, convex: false, density: 0.5, maxWidthMm: 0, curveChordMaxMm: 0.1 }]);
+    for (const bad of [{ maxSides: 2 }, { maxSides: 65 }, { maxSides: 4.5 }, { density: 2 }, { maxWidthMm: -1 }, { curveChordMaxMm: -0.1 }, { convex: "yes" }]) {
+      const rejected = await client.callTool({ name: "plasticity_export_obj", arguments: { ids: [7], path: "/tmp/part.obj", revision: "r1", ...bad } });
+      assert.equal(rejected.isError, true, JSON.stringify(bad));
+    }
     const invalid = await client.callTool({ name: "plasticity_export_obj", arguments: {
       ids: [7], path: "/tmp/part.obj", chordToleranceMm: 0, angleToleranceDegrees: 12, revision: "r1",
     } });

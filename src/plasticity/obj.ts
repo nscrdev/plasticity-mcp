@@ -6,7 +6,16 @@ export interface ObjValidation {
   textureCoordinates: number;
   normals: number;
   faces: number;
+  /** Triangle-equivalent count: each polygon face counts as (sides - 2) triangles. */
   triangles: number;
+  /** Faces with exactly three sides. */
+  triangleFaces: number;
+  /** Faces with exactly four sides. */
+  quads: number;
+  /** Faces with more than four sides. */
+  ngons: number;
+  /** Face count keyed by side count, e.g. { "4": 1440 }. */
+  sideHistogram: Record<string, number>;
   boundsMm: {
     min: [number, number, number];
     max: [number, number, number];
@@ -23,6 +32,7 @@ export function validateObj(data: Buffer): ObjValidation {
   let normals = 0;
   let faces = 0;
   let triangles = 0;
+  const sideHistogram: Record<string, number> = {};
   const vertices: Array<[number, number, number]> = [];
   for (const rawLine of text.split(/\r?\n/u)) {
     const line = rawLine.trim();
@@ -59,6 +69,8 @@ export function validateObj(data: Buffer): ObjValidation {
       for (const reference of fields.slice(1)) validateFaceReference(reference, vertices.length, textureCoordinates, normals);
       faces += 1;
       triangles += fields.length - 3;
+      const sides = String(fields.length - 1);
+      sideHistogram[sides] = (sideHistogram[sides] ?? 0) + 1;
     }
   }
   if (vertices.length === 0 || faces === 0) throw new Error("Plasticity produced an OBJ file without mesh vertices and faces");
@@ -77,6 +89,10 @@ export function validateObj(data: Buffer): ObjValidation {
     normals,
     faces,
     triangles,
+    triangleFaces: sideHistogram["3"] ?? 0,
+    quads: sideHistogram["4"] ?? 0,
+    ngons: Object.entries(sideHistogram).reduce((sum, [sides, count]) => sum + (Number(sides) > 4 ? count : 0), 0),
+    sideHistogram: Object.fromEntries(Object.entries(sideHistogram).sort((a, b) => Number(a[0]) - Number(b[0]))),
     boundsMm: { min, max, size: [max[0] - min[0], max[1] - min[1], max[2] - min[2]] },
   };
 }

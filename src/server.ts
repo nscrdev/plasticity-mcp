@@ -3622,14 +3622,25 @@ function createServerWithCatalog(
     revision,
   }).strict(), async ({ ids: bodyIds, path, chordToleranceMm, angleToleranceDegrees, revision: current }) =>
     await session.get().export3mf(bodyIds, path, current, chordToleranceMm, angleToleranceDegrees), false, { destructiveHint: false });
-  tool("plasticity_export_obj", "Tessellate current exact Solid or Sheet bodies to a new validated Wavefront OBJ without overwriting. Coordinates are written in millimeters with Z up; the result reports counts and bounds parsed from the saved file. OBJ is a derived mesh for interchange or rendering, so retain .plasticity, STEP, or Parasolid as the editable source.", z.object({
+  tool("plasticity_export_obj", "Tessellate current exact Solid or Sheet bodies to a new validated Wavefront OBJ without overwriting. Coordinates are written in millimeters with Z up; the result reports counts and bounds parsed from the saved file. OBJ is a derived mesh for interchange or rendering, so retain .plasticity, STEP, or Parasolid as the editable source. By default faces are triangles. Set maxSides to 4 for quad-dominant meshes (all quads at a fine chord/angle tolerance, e.g. chordToleranceMm 0.01 with angleToleranceDegrees 5), or higher (up to 64) to allow mixed quads and n-gons. Optional convex, density (0..1), maxWidthMm (0 = no limit) and curveChordMaxMm are passed to Plasticity only when given. The result reports triangleFaces, quads, ngons and a sideHistogram, and echoes meshOptions.", z.object({
     ids,
     path: z.string().min(1),
     chordToleranceMm: z.number().finite().positive().max(10).default(0.05),
     angleToleranceDegrees: z.number().finite().positive().max(90).default(15),
+    maxSides: z.number().int().min(3).max(64).optional(),
+    convex: z.boolean().optional(),
+    density: z.number().finite().min(0).max(1).optional(),
+    maxWidthMm: z.number().finite().min(0).optional(),
+    curveChordMaxMm: z.number().finite().min(0).optional(),
     revision,
-  }).strict(), async ({ ids: bodyIds, path, chordToleranceMm, angleToleranceDegrees, revision: current }) =>
-    await session.get().exportObj(bodyIds, path, current, chordToleranceMm, angleToleranceDegrees), false, { destructiveHint: false });
+  }).strict(), async ({ ids: bodyIds, path, chordToleranceMm, angleToleranceDegrees, maxSides, convex, density, maxWidthMm, curveChordMaxMm, revision: current }) =>
+    await session.get().exportObj(bodyIds, path, current, chordToleranceMm, angleToleranceDegrees, {
+      ...(maxSides !== undefined ? { maxSides } : {}),
+      ...(convex !== undefined ? { convex } : {}),
+      ...(density !== undefined ? { density } : {}),
+      ...(maxWidthMm !== undefined ? { maxWidthMm } : {}),
+      ...(curveChordMaxMm !== undefined ? { curveChordMaxMm } : {}),
+    }), false, { destructiveHint: false });
   tool("plasticity_export_svg", "Export coplanar native Wire profiles as a new millimeter-scaled SVG without overwriting. B-Rep Lines, full circles, trimmed circular arcs, and native Ellipse segments remain exact when Plasticity exposes their analytic carrier data; non-rational polynomial BCurves of integer degree 1 through 3, including periodic curves, are exported span-by-span as cubic Bezier commands only after additional exact B-Rep validation samples pass. Degree-1 and degree-2 non-rational fixtures have live production stdio verification with independent B-Rep samples on Plasticity 26.1.3. Rational BCurves that fit a conic and agree with 65 dense exact B-Rep samples are represented by an SVG ellipse/arc and marked with sampled-validation metadata; this does not prove global equality, and anything that fails validation uses the approximation path. Other planar B-Rep curves use an adaptive polyline checked at quarter samples against curveChordToleranceMm and curveChordAngleDegrees and are explicitly marked as approximations in SVG metadata. Returned deviation is the maximum tested chord deviation, not a proof of global error. Noncoplanar Wires are rejected; for Solid drawings use plasticity_export_hiddenline_svg. Keep the .plasticity or STEP file as the editable source.", z.object({
     ids: z.array(z.number().int().positive()).min(1).max(4096).refine((values) => new Set(values).size === values.length, "Wire IDs must be unique"),
     path: z.string().min(1),

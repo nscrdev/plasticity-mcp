@@ -134,6 +134,48 @@ test("rejects stale, duplicate, missing, and non-B-Rep 3MF body selections befor
   assert.equal(mutations, 0);
 });
 
+test("OBJ mesh options are validated and reach the factory only when given", async () => {
+  const root = await mkdtemp(join(tmpdir(), "plasticity-obj-opts-"));
+  let values: unknown[] | undefined;
+  const body = { id: 7, versionId: 17, type: "Solid", name: "Box", boundsMm: null, faceIds: [], edgeIds: [], faces: [], edges: [], vertices: [] };
+  const state: RuntimeState = { targetId: "window-1", title: "Untitled - Plasticity", documentToken: "document-1", revision: "r", dbVersion: 1, undoDepth: 0, redoDepth: 0, construction: emptyConstruction, regions: [], bodies: [body] };
+  let mutations = 0;
+  const runtime = {
+    async getState() { return state; },
+    async mutate(_source: string, _bindings: string[], args: unknown[]) {
+      mutations += 1;
+      values = args;
+      await writeFile((args[0] as { path: string }).path, Buffer.from("o Q\nv 0 0 0\nv 1 0 0\nv 1 1 0\nv 0 1 0\nf 1 2 3 4\n"));
+      return {};
+    },
+    isUncertain() { return false; },
+  } as unknown as PlasticityRuntime;
+  try {
+    const operations = new PlasticityOperations(runtime);
+    for (const [options, pattern] of [
+      [{ maxSides: 2 }, /maxSides/u], [{ maxSides: 65 }, /maxSides/u], [{ maxSides: 4.5 }, /maxSides/u],
+      [{ density: 1.1 }, /density/u], [{ density: Number.NaN }, /density/u],
+      [{ maxWidthMm: -1 }, /maxWidthMm/u], [{ curveChordMaxMm: Number.POSITIVE_INFINITY }, /curveChordMaxMm/u],
+    ] as const) {
+      await assert.rejects(operations.exportObj([7], join(root, "bad.obj"), "r", 0.05, 15, options), pattern);
+    }
+    assert.equal(mutations, 0);
+
+    const result = await operations.exportObj([7], join(root, "quad.obj"), "r", 0.01, 5, { maxSides: 4, convex: true, density: 0.25, maxWidthMm: 2, curveChordMaxMm: 0 });
+    const args = values?.[0] as Record<string, unknown>;
+    assert.equal(args.maxSides, 4);
+    assert.equal(args.convex, true);
+    assert.equal(args.density, 0.25);
+    assert.equal(args.maxWidth, 0.002);
+    assert.equal(args.curveChordMax, 0);
+    assert.deepEqual(result.meshOptions, { maxSides: 4, convex: true, density: 0.25, maxWidthMm: 2, curveChordMaxMm: 0 });
+    assert.equal(result.quads, 1);
+    assert.equal(result.triangleFaces, 0);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("exports selected native bodies as a validated millimeter OBJ mesh", async () => {
   const root = await mkdtemp(join(tmpdir(), "plasticity-obj-test-"));
   let call: { source: string; bindings: string[]; values: unknown[] } | undefined;
@@ -162,6 +204,8 @@ test("exports selected native bodies as a validated millimeter OBJ mesh", async 
     assert.match(call?.source ?? "", /factory\.unit = 'millimeter'/u);
     assert.match(call?.source ?? "", /factory\.upAxis = 'z'/u);
     assert.match(call?.source ?? "", /factory\.showWireframe = false/u);
+    assert.equal("maxSides" in exportArgs, false);
+    assert.deepEqual(Object.keys(exportArgs).sort(), ["angleToleranceDegrees", "chordTolerance", "ids", "path"]);
     assert.deepEqual(result, {
       path: output,
       bytes: payload.length,
@@ -173,9 +217,14 @@ test("exports selected native bodies as a validated millimeter OBJ mesh", async 
       normals: 1,
       faces: 1,
       triangles: 1,
+      triangleFaces: 1,
+      quads: 0,
+      ngons: 0,
+      sideHistogram: { "3": 1 },
       boundsMm: { min: [0, 0, 0], max: [20, 10, 5], size: [20, 10, 5] },
       chordToleranceMm: 0.08,
       angleToleranceDegrees: 12,
+      meshOptions: { maxSides: 3 },
     });
     assert.deepEqual(await readFile(output), payload);
     await assert.rejects(operations.exportObj([7], output, state.revision, 0.08, 12), /overwrite/u);

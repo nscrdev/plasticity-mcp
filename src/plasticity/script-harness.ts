@@ -23,11 +23,14 @@ export async function runInjectedScript(
   editor: object,
 ): Promise<unknown> {
   const fn = new Function(`return (${source});`)() as (...args: unknown[]) => Promise<unknown>;
+  // The runtime passes values and returns results by JSON (returnByValue); mirror that so native objects do not leak through.
+  values = JSON.parse(JSON.stringify(values)) as unknown[];
   const args = [...bindingNames.map((name) => {
     if (!(name in bindings)) throw new Error(`Plasticity native binding is unavailable: ${name}`);
     return bindings[name];
   }), ...values];
-  return await fn.apply(editor, args);
+  const result = await fn.apply(editor, args);
+  return result === undefined ? undefined : JSON.parse(JSON.stringify(result));
 }
 
 export interface FakeFactoryOptions {

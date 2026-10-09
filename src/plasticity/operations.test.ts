@@ -2990,8 +2990,9 @@ test("chamfer two-distance and apex are experimental opt-in and report the dista
 test("variable fillet is experimental opt-in and validates input", async () => {
   const box: { call: { source: string; bindings: string[]; values: unknown[] } | undefined } = { call: undefined };
   const last = () => box.call;
-  const body = { id: 7, versionId: 17, type: "Solid", name: null, boundsMm: null, faceIds: ["f1"], edgeIds: ["e1", "e2"], faces: [{ id: "f1", blendRadiusMm: null }], edges: [] };
-  let after = { ...body, faceIds: ["f1", "f2"], faces: [{ id: "f1", blendRadiusMm: null }, { id: "f2", blendRadiusMm: 2 }] };
+  const body = { id: 7, versionId: 17, type: "Solid", name: null, boundsMm: null, faceIds: ["f1"], edgeIds: ["e1", "e2"], faces: [{ id: "f1", centerMm: [0, 0, 0], blendRadiusMm: null }], edges: [] };
+  // Face ids are renumbered by the commit, as on the live app.
+  let after = { ...body, faceIds: ["g1", "g2"], faces: [{ id: "g1", centerMm: [0, 0, 0], blendRadiusMm: null }, { id: "g2", centerMm: [1, 2, 3], blendRadiusMm: 2 }] };
   let phase = 0;
   const base = { targetId: "window-1", title: "Untitled - Plasticity", documentToken: "document-1", revision: "current-revision", dbVersion: 1, undoDepth: 0, redoDepth: 0, regions: [], construction: emptyConstruction };
   const runtime = {
@@ -3017,13 +3018,13 @@ test("variable fillet is experimental opt-in and validates input", async () => {
   }]);
   assert.equal(result.experimental?.verified, false);
   assert.deepEqual(result.experimental?.resolvedPoints, [{ edgeId: "e1", t: 0.25, pointMm: [1, 2, 3], distanceMm: 0, radiusMm: 2 }]);
-  assert.deepEqual([result.experimental?.faceCountBefore, result.experimental?.faceCountAfter, result.experimental?.newBlendFaceIds], [1, 2, ["f2"]]);
+  assert.deepEqual([result.experimental?.faceCountBefore, result.experimental?.faceCountAfter, result.experimental?.newBlendFaces], [1, 2, [{ centerMm: [1, 2, 3], blendRadiusMm: 2 }]]);
 
   // Read-back: unchanged topology after a "successful" commit fails loudly.
   phase = 0;
   after = { ...body };
   await assert.rejects(operations.filletVariable(7, ["e1"], 1, [{ edgeId: "e1", t: 0.5, radiusMm: 2 }], rev, opt), /topology did not change/u);
-  after = { ...body, faceIds: ["f1", "f2"], faces: [{ id: "f1", blendRadiusMm: null }, { id: "f2", blendRadiusMm: 2 }] };
+  after = { ...body, faceIds: ["g1", "g2"], faces: [{ id: "g1", centerMm: [0, 0, 0], blendRadiusMm: null }, { id: "g2", centerMm: [1, 2, 3], blendRadiusMm: 2 }] };
 
   box.call = undefined;
   phase = 0;

@@ -95,9 +95,9 @@ export function rewriteMtlTextureReferences(data: Buffer, renames: Map<string, s
   return changed ? Buffer.from(rewritten, "utf8") : data;
 }
 
-/** Replaces whitespace runs so the name is a single token in `mtllib` lines. */
+/** Maps everything outside [A-Za-z0-9._-] (whitespace, `#`, control characters) to `_` so the name is one safe `mtllib` token. */
 export function objSiblingStem(stem: string): string {
-  const cleaned = stem.replace(/\s+/gu, "_");
+  const cleaned = stem.replace(/[^A-Za-z0-9._-]+/gu, "_");
   return cleaned.length > 0 ? cleaned : "geometry";
 }
 

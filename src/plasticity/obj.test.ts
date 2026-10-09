@@ -115,3 +115,11 @@ test("rewrites MTL texture references only when they name a renamed staging file
   assert.equal(out, "newmtl m\nmap_Kd stick.png\nmap_Bump -bm 1 stick.png\nmap_Ks other.png\nKd 1 0 0\n");
   assert.equal(rewriteMtlTextureReferences(mtl, new Map([["x.png", "y.png"]])), mtl);
 });
+
+test("objSiblingStem maps everything outside [A-Za-z0-9._-] to underscores (comment marker, control characters)", async () => {
+  const { objSiblingStem } = await import("./obj.ts");
+  assert.equal(objSiblingStem("my#part"), "my_part");
+  assert.equal(objSiblingStem("a b\u0085c\u001fd"), "a_b_c_d");
+  assert.equal(objSiblingStem("ok-name_1.v2"), "ok-name_1.v2");
+  assert.equal(objSiblingStem(""), "geometry");
+});

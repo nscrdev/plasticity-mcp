@@ -184,17 +184,23 @@ test("chamfer script failure paths: unknown edge and missing ChamferMode binding
 
 // ---------------------------------------------------------------- variable fillet script
 
-function filletHarness(options: { members?: Record<string, (...args: any[]) => unknown>; busy?: boolean; faceGain?: boolean } = {}) {
+function filletHarness(options: { members?: Record<string, (...args: any[]) => unknown>; busy?: boolean; faceGain?: boolean; existingFillet?: boolean; plainFaceOnly?: boolean } = {}) {
   const record = newFactoryRecord();
   const Factory = createFakeFactory({
     record,
     members: options.members ?? { addVariationPoint(_point: unknown, _radius: unknown) { return undefined; } },
   });
-  const before = { ...plainBody(7, null), faceIds: ["f1"], faces: [{ id: "f1", blendRadiusMm: null }] };
-  const after = { ...before, faceIds: ["f1", "f2"], faces: [{ id: "f1", blendRadiusMm: null }, { id: "f2", blendRadiusMm: 2 }] };
+  // The commit renumbers every face id (ids are revision-bound), so the guard must not rely on id stability.
+  const existing = options.existingFillet === true;
+  const base = [{ id: "f1", centerMm: [0, 0, 0], blendRadiusMm: null }, ...(existing ? [{ id: "f2", centerMm: [5, 5, 5], blendRadiusMm: 2 }] : [])];
+  const before = { ...plainBody(7, null), faceIds: base.map((face) => face.id), faces: base };
+  const renumbered = base.map((face, index) => ({ ...face, id: `g${index + 1}` }));
+  const grown = [...renumbered, { id: `g${renumbered.length + 1}`, centerMm: [1, 2, 3], blendRadiusMm: 3 }];
+  const rebuilt = options.faceGain === false ? renumbered : options.plainFaceOnly === true ? [...renumbered, { id: "g9", centerMm: [9, 9, 9], blendRadiusMm: null }] : grown;
+  const after = { ...before, versionId: 99, faceIds: rebuilt.map((face) => face.id), faces: rebuilt };
   let committed = false;
   const operations = new PlasticityOperations(harnessRuntime({
-    state: () => stateWith([committed && options.faceGain !== false ? after : before]),
+    state: () => stateWith([committed ? after : before]),
     editor: () => createFakeEditor({ bodyId: 7, edges: [line("e1", 51)], busy: options.busy === true }),
     bindings: { FilletShellFactory: Factory },
     onMutate: () => { committed = true; },
@@ -218,7 +224,7 @@ test("variable fillet script passes the same native point type for t and pointMm
   assert.ok(Math.abs(resolved[1]!.t - 0.5) < 1e-6);
   assert.ok(Math.abs(resolved[1]!.pointMm[0] - 10) < 1e-4);
   assert.ok(resolved[1]!.distanceMm < 1e-6);
-  assert.deepEqual(result.experimental!.newBlendFaceIds, ["f2"]);
+  assert.deepEqual(result.experimental!.newBlendFaces, [{ centerMm: [1, 2, 3], blendRadiusMm: 3 }]);
 });
 
 test("variable fillet refuses a pointMm that is off its edge before building any factory", async () => {
@@ -247,6 +253,16 @@ test("variable fillet script failure paths: native throw, missing member, arity 
 
   const noop = filletHarness({ faceGain: false });
   await assert.rejects(noop.operations.filletVariable(7, ["e1"], 1, [{ edgeId: "e1", t: 0.5, radiusMm: 2 }], "r", { experimental: true }), /topology did not change/u);
+
+  // An older fillet on the body must not make a rebuild without a new face look like success.
+  const rebuild = filletHarness({ existingFillet: true, faceGain: false });
+  await assert.rejects(rebuild.operations.filletVariable(7, ["e1"], 1, [{ edgeId: "e1", t: 0.5, radiusMm: 2 }], "r", { experimental: true }), /faces 2 -> 2, blend faces 1 -> 1/u);
+  const plainOnly = filletHarness({ existingFillet: true, plainFaceOnly: true });
+  await assert.rejects(plainOnly.operations.filletVariable(7, ["e1"], 1, [{ edgeId: "e1", t: 0.5, radiusMm: 2 }], "r", { experimental: true }), /blend faces 1 -> 1/u);
+  // With an older fillet present and a real new face, only the new blend face is listed (ids renumbered).
+  const withOld = await filletHarness({ existingFillet: true }).operations.filletVariable(7, ["e1"], 1, [{ edgeId: "e1", t: 0.5, radiusMm: 2 }], "r", { experimental: true });
+  assert.deepEqual(withOld.experimental!.newBlendFaces, [{ centerMm: [1, 2, 3], blendRadiusMm: 3 }]);
+  assert.deepEqual([withOld.experimental!.blendFaceCountBefore, withOld.experimental!.blendFaceCountAfter], [1, 2]);
 
   const unknownEdge = filletHarness();
   await assert.rejects(unknownEdge.operations.filletVariable(7, ["nope"], 1, [{ edgeId: "nope", t: 0.5, radiusMm: 2 }], "r", { experimental: true }), /Stale or unknown edge: nope/u);
@@ -336,5 +352,79 @@ test("copied MTL keeps texture references valid when the staging name is renamed
     await operations.exportObj([7], join(root, "stick.obj"), "r", 0.05, 15);
     assert.equal(await readFile(join(root, "stick.mtl"), "utf8"), "newmtl m1\nmap_Kd stick.png\nmap_Ks elsewhere.png\n");
     assert.deepEqual((await readdir(root)).sort(), ["stick.mtl", "stick.obj", "stick.png"]);
+  });
+});
+
+// ---------------------------------------------------------------- publish failure paths (F2)
+
+type PublishSeams = { linkFile: (from: string, to: string) => Promise<void>; copyExclusive: (from: string, to: string) => Promise<void> };
+const errno = (code: string) => Object.assign(new Error(`${code}: simulated`), { code });
+
+test("a failure while publishing the last file removes everything already published", async () => {
+  await withRoot(async (root) => {
+    const operations = new PlasticityOperations(fsRuntime([plainBody(7, "A")], async (path) => { await mtlNextTo(path); }));
+    const seams = operations as unknown as PublishSeams;
+    const original = seams.linkFile.bind(operations);
+    let calls = 0;
+    seams.linkFile = async (from, to) => { calls += 1; if (calls === 2) throw errno("EIO"); await original(from, to); };
+    await assert.rejects(operations.exportObj([7], join(root, "part.obj"), "r", 0.05, 15), /EIO/u);
+    assert.equal(calls, 2);
+    assert.deepEqual(await readdir(root), [], "the MTL published first is rolled back and no staging folder is left");
+  });
+});
+
+test("an exclusive-create collision during publish never removes the other party's file", async () => {
+  await withRoot(async (root) => {
+    const operations = new PlasticityOperations(fsRuntime([plainBody(7, "A")], async (path) => { await mtlNextTo(path); }));
+    const seams = operations as unknown as PublishSeams;
+    const original = seams.linkFile.bind(operations);
+    seams.linkFile = async (from, to) => {
+      if (to.endsWith(".obj")) { await writeFile(to, "someone else\n"); throw errno("EEXIST"); }
+      await original(from, to);
+    };
+    await assert.rejects(operations.exportObj([7], join(root, "part.obj"), "r", 0.05, 15), /EEXIST/u);
+    assert.deepEqual(await readdir(root), ["part.obj"]);
+    assert.equal(await readFile(join(root, "part.obj"), "utf8"), "someone else\n");
+  });
+});
+
+test("without hard-link support the copy goes to a temporary name: a truncated copy leaves no target and no temp file", async () => {
+  await withRoot(async (root) => {
+    const operations = new PlasticityOperations(fsRuntime([plainBody(7, "A")], async (path) => { await mtlNextTo(path); }));
+    const seams = operations as unknown as PublishSeams;
+    seams.linkFile = async () => { throw errno("EXDEV"); };
+    const original = seams.copyExclusive.bind(operations);
+    let copies = 0;
+    seams.copyExclusive = async (from, to) => {
+      copies += 1;
+      if (copies === 2) { await writeFile(to, "trunc"); throw errno("ENOSPC"); }
+      await original(from, to);
+    };
+    await assert.rejects(operations.exportObj([7], join(root, "part.obj"), "r", 0.05, 15), /ENOSPC/u);
+    assert.deepEqual(await readdir(root), [], "no truncated part.obj, no .partial file, and the first copy is rolled back");
+  });
+});
+
+test("the copy fallback publishes complete files when hard links are unsupported", async () => {
+  await withRoot(async (root) => {
+    const operations = new PlasticityOperations(fsRuntime([plainBody(7, "A")], async (path) => { await mtlNextTo(path); }));
+    (operations as unknown as PublishSeams).linkFile = async () => { throw errno("EXDEV"); };
+    const result = await operations.exportObj([7], join(root, "part.obj"), "r", 0.05, 15);
+    assert.deepEqual((await readdir(root)).sort(), ["part.mtl", "part.obj"]);
+    assert.equal(await readFile(join(root, "part.obj"), "utf8"), OBJ);
+    assert.equal(result.mtl.written, true);
+  });
+});
+
+test("perBody export rolls back earlier bodies when a later publish fails", async () => {
+  await withRoot(async (root) => {
+    const directory = join(root, "parts");
+    const operations = new PlasticityOperations(fsRuntime([plainBody(7, "A"), plainBody(8, "B")], async (path) => { await mtlNextTo(path); }));
+    const seams = operations as unknown as PublishSeams;
+    const original = seams.linkFile.bind(operations);
+    let calls = 0;
+    seams.linkFile = async (from, to) => { calls += 1; if (calls === 3) throw errno("EIO"); await original(from, to); };
+    await assert.rejects(operations.exportObj([7, 8], directory, "r", 0.05, 15, {}, { perBody: true }), /EIO/u);
+    assert.deepEqual(await readdir(directory), []);
   });
 });

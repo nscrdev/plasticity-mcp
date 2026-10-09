@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { constants } from "node:fs";
-import { copyFile, lstat, mkdir, mkdtemp, open, readdir, readFile, realpath, rm, rmdir, stat, unlink, writeFile } from "node:fs/promises";
+import { copyFile, link, lstat, mkdir, mkdtemp, open, readdir, readFile, realpath, rename, rm, rmdir, stat, unlink, writeFile } from "node:fs/promises";
 import { basename, dirname, extname, join, resolve } from "node:path";
 
 import { LONG_NATIVE_IMPORT_TIMEOUT_MS, NATIVE_STATE_READ_TIMEOUT_MS, PlasticityRuntime, type RuntimeState } from "./runtime.ts";
@@ -512,9 +512,10 @@ export interface ExperimentalVariableFilletReport {
   resolvedPoints: Array<{ edgeId: string; t: number; pointMm: Vector3; distanceMm: number; radiusMm: number }>;
   faceCountBefore: number;
   faceCountAfter: number;
-  newFaceIds: string[];
-  newBlendFaceIds: string[];
-  newBlendRadiiMm: Array<number | null>;
+  blendFaceCountBefore: number;
+  blendFaceCountAfter: number;
+  /** Blend faces with no matching centre and radius before the commit. Face ids are revision-bound, so none are reported. */
+  newBlendFaces: Array<{ centerMm: [number, number, number]; blendRadiusMm: number | null }>;
 }
 
 /** A pointMm farther than this from its named edge is refused (0.05 mm, in metres). */
@@ -545,9 +546,8 @@ export interface ObjFileResult extends ObjValidation {
 
 interface PublishItem {
   to: string;
-  /** In-memory content; otherwise copied from `from`. */
-  data?: Buffer;
-  from?: string;
+  /** Final content, already written into the private staging folder next to the target. */
+  from: string;
 }
 
 interface StagedObjFile {
@@ -5118,11 +5118,16 @@ export class PlasticityOperations {
     if (!afterBody) {
       throw new Error("Variable fillet committed but the body is no longer present under its id; inspect the scene before retrying (outcome unverified)");
     }
-    const beforeFaceIds = new Set(beforeBody.faceIds);
-    const newFaces = afterBody.faces.filter((face) => !beforeFaceIds.has(face.id));
-    const newBlendFaces = newFaces.filter((face) => face.blendRadiusMm !== null);
-    if (newFaces.length === 0 || (afterBody.faces.length <= beforeBody.faces.length && newBlendFaces.length === 0)) {
-      throw new Error(`Variable fillet reported success but the body topology did not change as a fillet would (faces ${beforeBody.faces.length} -> ${afterBody.faces.length}, new faces ${newFaces.length}, new blend faces ${newBlendFaces.length}); the native call was probably ignored. Check the document before relying on it`);
+    // Face ids are revision-bound (a commit can renumber every face), so the check never compares ids:
+    // it uses face and blend-face counts, and identifies new blend faces by geometry (centre and radius).
+    const blendKey = (face: { centerMm: [number, number, number]; blendRadiusMm: number | null }) =>
+      `${face.centerMm.map((value) => value.toFixed(4)).join(",")}|${face.blendRadiusMm?.toFixed(4)}`;
+    const blendBefore = beforeBody.faces.filter((face) => face.blendRadiusMm !== null);
+    const blendAfter = afterBody.faces.filter((face) => face.blendRadiusMm !== null);
+    const knownBlend = new Set(blendBefore.map(blendKey));
+    const newBlendFaces = blendAfter.filter((face) => !knownBlend.has(blendKey(face)));
+    if (afterBody.faces.length <= beforeBody.faces.length || blendAfter.length <= blendBefore.length) {
+      throw new Error(`Variable fillet reported success but the body topology did not change as a fillet would (faces ${beforeBody.faces.length} -> ${afterBody.faces.length}, blend faces ${blendBefore.length} -> ${blendAfter.length}); the native call was probably ignored. Check the document before relying on it`);
     }
     return {
       ...after,
@@ -5132,9 +5137,9 @@ export class PlasticityOperations {
         resolvedPoints: resolved,
         faceCountBefore: beforeBody.faces.length,
         faceCountAfter: afterBody.faces.length,
-        newFaceIds: newFaces.map((face) => face.id),
-        newBlendFaceIds: newBlendFaces.map((face) => face.id),
-        newBlendRadiiMm: newBlendFaces.map((face) => face.blendRadiusMm),
+        blendFaceCountBefore: blendBefore.length,
+        blendFaceCountAfter: blendAfter.length,
+        newBlendFaces: newBlendFaces.map((face) => ({ centerMm: face.centerMm, blendRadiusMm: face.blendRadiusMm })),
       },
     };
   }
@@ -9182,18 +9187,24 @@ export class PlasticityOperations {
       return { name, from: join(staging, name), to: join(dirname(output), renamed) };
     });
     if (new Set(siblingTargets.map((target) => target.to)).size !== siblingTargets.length) throw new Error("Plasticity wrote several sibling files with the same extension; refusing to rename them onto one path");
+    // Everything is finalised inside the staging folder, so publishing only links or copies finished files.
     const items: PublishItem[] = [];
     for (const target of siblingTargets) {
       if (extname(target.name).toLowerCase() === ".mtl") {
         const mtl = await readFile(target.from);
-        items.push({ to: target.to, data: rewriteMtlTextureReferences(mtl, renames) });
-      } else {
-        items.push({ to: target.to, from: target.from });
+        const rewritten = rewriteMtlTextureReferences(mtl, renames);
+        if (rewritten !== mtl) await writeFile(target.from, rewritten);
       }
+      items.push({ to: target.to, from: target.from });
     }
     const data = rewriteObjMaterialLibraries(original, renames);
+    let finalObj = temporary;
+    if (data !== original) {
+      finalObj = join(staging, "final.obj");
+      await writeFile(finalObj, data);
+    }
     // The OBJ goes last so that its presence means every sibling was published.
-    items.push(data === original ? { to: output, from: temporary } : { to: output, data });
+    items.push({ to: output, from: finalObj });
     return {
       output,
       items,
@@ -9208,9 +9219,43 @@ export class PlasticityOperations {
     };
   }
 
+  /** Exclusive, atomic publish of one finished file. Overridable seam for failure-path tests. */
+  protected async linkFile(from: string, to: string): Promise<void> {
+    await link(from, to);
+  }
+
+  protected async copyExclusive(from: string, to: string): Promise<void> {
+    await copyFile(from, to, constants.COPYFILE_EXCL);
+  }
+
   /**
-   * Publishes every staged file of every export, or none: all target paths are checked first, files are written
-   * exclusively, and anything this call created is removed again when a write fails.
+   * Publishes one staged file without ever leaving a partial target: a hard link from the staging folder
+   * (same directory, atomic and exclusive), or, where links are unsupported, a copy to a temporary name that is
+   * renamed into place. A failed copy only ever leaves the temporary name, which is removed again.
+   */
+  private async publishOne(item: PublishItem): Promise<void> {
+    try {
+      await this.linkFile(item.from, item.to);
+      return;
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code;
+      if (!["EXDEV", "EPERM", "ENOTSUP", "EOPNOTSUPP", "ENOSYS", "EMLINK"].includes(code ?? "")) throw error;
+    }
+    const temporary = `${item.to}.${randomUUID().slice(0, 8)}.partial`;
+    try {
+      await this.copyExclusive(item.from, temporary);
+      await assertAbsent(item.to);
+      await rename(temporary, item.to);
+    } catch (error) {
+      await unlink(temporary).catch(() => undefined);
+      throw error;
+    }
+  }
+
+  /**
+   * Publishes every staged file of every export, or none: all target paths are checked first, each file is
+   * published atomically and exclusively (never a truncated target), and anything this call published is
+   * removed again when a later file fails. Files that could not be removed are named in the error.
    */
   private async publishStagedObjFiles(staged: StagedObjFile[]): Promise<ObjFileResult[]> {
     const items = staged.flatMap((entry) => entry.items);
@@ -9219,12 +9264,17 @@ export class PlasticityOperations {
     const created: string[] = [];
     try {
       for (const item of items) {
-        if (item.data !== undefined) await writeFile(item.to, item.data, { flag: "wx" });
-        else await copyFile(item.from!, item.to, constants.COPYFILE_EXCL);
+        await this.publishOne(item);
         created.push(item.to);
       }
     } catch (error) {
-      for (const path of created) await unlink(path).catch(() => undefined);
+      const leftovers: string[] = [];
+      for (const path of created) {
+        await unlink(path).catch((unlinkError: NodeJS.ErrnoException) => { if (unlinkError.code !== "ENOENT") leftovers.push(path); });
+      }
+      if (leftovers.length > 0) {
+        throw new Error(`${error instanceof Error ? error.message : String(error)}; could not remove already published file(s): ${leftovers.join(", ")}`);
+      }
       throw error;
     }
     return staged.map((entry) => ({

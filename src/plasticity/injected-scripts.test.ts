@@ -213,7 +213,7 @@ test("variable fillet script passes the same native point type for t and pointMm
   const result = await operations.filletVariable(7, ["e1"], 1, [
     { edgeId: "e1", t: 0.25, radiusMm: 2 },
     { edgeId: "e1", pointMm: [10, 0, 0], radiusMm: 3 },
-  ], "r", { experimental: true });
+  ], "r", { experimental: true, assumeNativeSignature: true });
   const calls = record.calls.filter(([name]) => name === "addVariationPoint");
   assert.equal(calls.length, 2);
   for (const [, args] of calls) assert.ok(args[0] instanceof NativePoint, "both paths pass the native position object");
@@ -229,43 +229,43 @@ test("variable fillet script passes the same native point type for t and pointMm
 
 test("variable fillet refuses a pointMm that is off its edge before building any factory", async () => {
   const { record, operations } = filletHarness();
-  await assert.rejects(operations.filletVariable(7, ["e1"], 1, [{ edgeId: "e1", pointMm: [10, 5, 0], radiusMm: 3 }], "r", { experimental: true }), /5\.000 mm from edge e1/u);
+  await assert.rejects(operations.filletVariable(7, ["e1"], 1, [{ edgeId: "e1", pointMm: [10, 5, 0], radiusMm: 3 }], "r", { experimental: true, assumeNativeSignature: true }), /5\.000 mm from edge e1/u);
   assert.equal(record.constructed, 0);
   // 0.04 mm off is inside the tolerance, 0.06 mm is outside.
-  await filletHarness().operations.filletVariable(7, ["e1"], 1, [{ edgeId: "e1", pointMm: [10, 0.04, 0], radiusMm: 3 }], "r", { experimental: true });
-  await assert.rejects(filletHarness().operations.filletVariable(7, ["e1"], 1, [{ edgeId: "e1", pointMm: [10, 0.06, 0], radiusMm: 3 }], "r", { experimental: true }), /mm from edge/u);
+  await filletHarness().operations.filletVariable(7, ["e1"], 1, [{ edgeId: "e1", pointMm: [10, 0.04, 0], radiusMm: 3 }], "r", { experimental: true, assumeNativeSignature: true });
+  await assert.rejects(filletHarness().operations.filletVariable(7, ["e1"], 1, [{ edgeId: "e1", pointMm: [10, 0.06, 0], radiusMm: 3 }], "r", { experimental: true, assumeNativeSignature: true }), /mm from edge/u);
 });
 
 test("variable fillet script failure paths: native throw, missing member, arity mismatch, busy editor, silent no-op", async () => {
   const thrower = filletHarness({ members: { addVariationPoint(_point: unknown, _radius: unknown) { throw new Error("native rejected the variation point"); } } });
-  await assert.rejects(thrower.operations.filletVariable(7, ["e1"], 1, [{ edgeId: "e1", t: 0.5, radiusMm: 2 }], "r", { experimental: true }), /native rejected the variation point/u);
+  await assert.rejects(thrower.operations.filletVariable(7, ["e1"], 1, [{ edgeId: "e1", t: 0.5, radiusMm: 2 }], "r", { experimental: true, assumeNativeSignature: true }), /native rejected the variation point/u);
 
   const missing = filletHarness({ members: {} });
-  await assert.rejects(missing.operations.filletVariable(7, ["e1"], 1, [{ edgeId: "e1", t: 0.5, radiusMm: 2 }], "r", { experimental: true }), /two-argument signature/u);
+  await assert.rejects(missing.operations.filletVariable(7, ["e1"], 1, [{ edgeId: "e1", t: 0.5, radiusMm: 2 }], "r", { experimental: true, assumeNativeSignature: true }), /two-argument signature/u);
   assert.equal(missing.record.constructed, 0, "arity is checked before a command or factory is built");
 
   const wide = filletHarness({ members: { addVariationPoint(_a: unknown, _b: unknown, _c: unknown) { return undefined; } } });
-  await assert.rejects(wide.operations.filletVariable(7, ["e1"], 1, [{ edgeId: "e1", t: 0.5, radiusMm: 2 }], "r", { experimental: true }), /two-argument signature/u);
+  await assert.rejects(wide.operations.filletVariable(7, ["e1"], 1, [{ edgeId: "e1", t: 0.5, radiusMm: 2 }], "r", { experimental: true, assumeNativeSignature: true }), /two-argument signature/u);
   assert.equal(wide.record.constructed, 0);
 
   const busy = filletHarness({ busy: true });
-  await assert.rejects(busy.operations.filletVariable(7, ["e1"], 1, [{ edgeId: "e1", t: 0.5, radiusMm: 2 }], "r", { experimental: true }), /busy/u);
+  await assert.rejects(busy.operations.filletVariable(7, ["e1"], 1, [{ edgeId: "e1", t: 0.5, radiusMm: 2 }], "r", { experimental: true, assumeNativeSignature: true }), /busy/u);
 
   const noop = filletHarness({ faceGain: false });
-  await assert.rejects(noop.operations.filletVariable(7, ["e1"], 1, [{ edgeId: "e1", t: 0.5, radiusMm: 2 }], "r", { experimental: true }), /topology did not change/u);
+  await assert.rejects(noop.operations.filletVariable(7, ["e1"], 1, [{ edgeId: "e1", t: 0.5, radiusMm: 2 }], "r", { experimental: true, assumeNativeSignature: true }), /topology did not change/u);
 
   // An older fillet on the body must not make a rebuild without a new face look like success.
   const rebuild = filletHarness({ existingFillet: true, faceGain: false });
-  await assert.rejects(rebuild.operations.filletVariable(7, ["e1"], 1, [{ edgeId: "e1", t: 0.5, radiusMm: 2 }], "r", { experimental: true }), /faces 2 -> 2, blend faces 1 -> 1/u);
+  await assert.rejects(rebuild.operations.filletVariable(7, ["e1"], 1, [{ edgeId: "e1", t: 0.5, radiusMm: 2 }], "r", { experimental: true, assumeNativeSignature: true }), /faces 2 -> 2, blend faces 1 -> 1/u);
   const plainOnly = filletHarness({ existingFillet: true, plainFaceOnly: true });
-  await assert.rejects(plainOnly.operations.filletVariable(7, ["e1"], 1, [{ edgeId: "e1", t: 0.5, radiusMm: 2 }], "r", { experimental: true }), /blend faces 1 -> 1/u);
+  await assert.rejects(plainOnly.operations.filletVariable(7, ["e1"], 1, [{ edgeId: "e1", t: 0.5, radiusMm: 2 }], "r", { experimental: true, assumeNativeSignature: true }), /blend faces 1 -> 1/u);
   // With an older fillet present and a real new face, only the new blend face is listed (ids renumbered).
-  const withOld = await filletHarness({ existingFillet: true }).operations.filletVariable(7, ["e1"], 1, [{ edgeId: "e1", t: 0.5, radiusMm: 2 }], "r", { experimental: true });
+  const withOld = await filletHarness({ existingFillet: true }).operations.filletVariable(7, ["e1"], 1, [{ edgeId: "e1", t: 0.5, radiusMm: 2 }], "r", { experimental: true, assumeNativeSignature: true });
   assert.deepEqual(withOld.experimental!.newBlendFaces, [{ centerMm: [1, 2, 3], blendRadiusMm: 3 }]);
   assert.deepEqual([withOld.experimental!.blendFaceCountBefore, withOld.experimental!.blendFaceCountAfter], [1, 2]);
 
   const unknownEdge = filletHarness();
-  await assert.rejects(unknownEdge.operations.filletVariable(7, ["nope"], 1, [{ edgeId: "nope", t: 0.5, radiusMm: 2 }], "r", { experimental: true }), /Stale or unknown edge: nope/u);
+  await assert.rejects(unknownEdge.operations.filletVariable(7, ["nope"], 1, [{ edgeId: "nope", t: 0.5, radiusMm: 2 }], "r", { experimental: true, assumeNativeSignature: true }), /Stale or unknown edge: nope/u);
 });
 
 // ---------------------------------------------------------------- file-system atomicity and naming
@@ -427,4 +427,21 @@ test("perBody export rolls back earlier bodies when a later publish fails", asyn
     await assert.rejects(operations.exportObj([7, 8], directory, "r", 0.05, 15, {}, { perBody: true }), /EIO/u);
     assert.deepEqual(await readdir(directory), []);
   });
+});
+
+test("variable fillet is refused before any runtime call and leaves the document untouched", async () => {
+  const { record, operations } = filletHarness();
+  let runtimeCalls = 0;
+  const runtime = (operations as unknown as { runtime: Record<string, (...args: unknown[]) => unknown> }).runtime;
+  for (const name of Object.keys(runtime)) {
+    const original = runtime[name];
+    if (typeof original === "function") runtime[name] = (...args: unknown[]) => { runtimeCalls += 1; return original.apply(runtime, args); };
+  }
+  await assert.rejects(
+    operations.filletVariable(7, ["e1"], 1, [{ edgeId: "e1", t: 0.5, radiusMm: 2 }], "r", { experimental: true }),
+    /variable fillet not supported yet: native addVariationPoint signature unknown/u,
+  );
+  assert.equal(runtimeCalls, 0);
+  assert.equal(record.constructed, 0);
+  assert.equal(record.committed, 0);
 });

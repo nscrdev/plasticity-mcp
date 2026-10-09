@@ -3000,7 +3000,7 @@ test("variable fillet is experimental opt-in and validates input", async () => {
     async mutate(source: string, bindings: string[], values: unknown[]) { box.call = { source, bindings, values }; phase = 1; return [{ edgeId: "e1", t: 0.25, pointMm: [1, 2, 3], distanceMm: 0, radiusMm: 2 }]; },
   } as unknown as PlasticityRuntime;
   const operations = new PlasticityOperations(runtime);
-  const opt = { experimental: true };
+  const opt = { experimental: true, assumeNativeSignature: true };
   const rev = "current-revision";
 
   await assert.rejects(operations.filletVariable(7, ["e1"], 1, [{ edgeId: "e1", t: 0.5, radiusMm: 2 }], rev), /EXPERIMENTAL/u);

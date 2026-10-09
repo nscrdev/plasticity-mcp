@@ -400,6 +400,15 @@ const verifyFields = (factory, label, expected) => {
   return readBack;
 };`;
 
+/**
+ * Studio surfacing tools need a Studio licence. On an Indie licence the native call throws a bare "Error", so the
+ * injected scripts check these two zero-argument native functions first. Only the booleans are inspected; no
+ * licence value is returned or logged.
+ */
+const studioLicenceBindings = ["isStudioLicense", "hasXNurbs"];
+const studioLicenceGuard = `if (isStudioLicense() !== true) throw new Error('Plasticity Studio licence not active (isStudioLicense false)');
+if (hasXNurbs() !== true) throw new Error('Plasticity Studio licence not active (hasXNurbs false)');`;
+
 const findFaceViews = `${findView}
 const selectedFaces = args.faces.map(reference => {
   const view = find(reference.bodyId);
@@ -492,7 +501,7 @@ export interface ObjMeshOptions {
 export interface ChamferOptions {
   /** EXPERIMENTAL (needs experimental: true). Second distance for a two-distance chamfer, in mm. */
   distance2Mm?: number;
-  /** EXPERIMENTAL (needs experimental: true). Native ChamferMode: Offset or Apex. */
+  /** EXPERIMENTAL (needs experimental: true). Native ChamferMode: Offset or Apex. Live test: with no mode the native default behaves like Apex, not Offset. */
   mode?: "offset" | "apex";
   /** Explicit opt-in for the unverified distance2Mm / mode paths. */
   experimental?: boolean;
@@ -5005,6 +5014,7 @@ export class PlasticityOperations {
   }
 
   /**
+   * REFUSED for now (see the guard in the body): the native addVariationPoint rejects a position object.
    * EXPERIMENTAL variable-radius fillet, refused unless `experimental: true`. UNVERIFIED against the live app:
    * `addVariationPoint` has declared arity 2 and the argument order (point, radius) in metres is inferred, not read.
    * Every variation point is resolved to a native edge position (the `position` object of GetPointAndTangent) by
@@ -5012,8 +5022,13 @@ export class PlasticityOperations {
    * t / point is returned. After commit the body's faces are compared with the state before and the call fails
    * loudly when nothing changed.
    */
-  async filletVariable(id: number, edgeIds: string[], radiusMm: number, points: VariableFilletPoint[], revision: string, options: { experimental?: boolean } = {}): Promise<RuntimeState & { experimental?: ExperimentalVariableFilletReport }> {
+  async filletVariable(id: number, edgeIds: string[], radiusMm: number, points: VariableFilletPoint[], revision: string, options: { experimental?: boolean; assumeNativeSignature?: boolean } = {}): Promise<RuntimeState & { experimental?: ExperimentalVariableFilletReport }> {
     if (options.experimental !== true) throw new Error("plasticity_fillet_variable is EXPERIMENTAL and unverified against the live app; pass experimental: true to use it");
+    // Live test: the native addVariationPoint expects a topology item, not the position object passed below, and
+    // throws inside lookupTopologyItem. The arity check cannot catch that, so refuse before any runtime call
+    // (the document stays untouched). `assumeNativeSignature` is not exposed by the server; it only lets tests
+    // exercise the script below until the real native argument is known.
+    if (options.assumeNativeSignature !== true) throw new Error("variable fillet not supported yet: native addVariationPoint signature unknown (it expects a topology item, not a point); no native call was made and the document is untouched");
     const before = await this.assertRevision(revision);
     if (!Number.isFinite(radiusMm) || radiusMm <= 0) throw new Error("Variable fillet base radiusMm must be a positive finite millimeter value");
     if (points.length === 0) throw new Error("Variable fillet needs at least one variation point");
@@ -5116,7 +5131,7 @@ export class PlasticityOperations {
     const after = await this.state();
     const afterBody = after.bodies.find((body) => body.id === id);
     if (!afterBody) {
-      throw new Error("Variable fillet committed but the body is no longer present under its id; inspect the scene before retrying (outcome unverified)");
+      throw new Error("Variable fillet committed but the body is no longer present under its id; a history step may have been committed: check undo depth and Undo before retrying (outcome unverified)");
     }
     // Face ids are revision-bound (a commit can renumber every face), so the check never compares ids:
     // it uses face and blend-face counts, and identifies new blend faces by geometry (centre and radius).
@@ -5127,7 +5142,7 @@ export class PlasticityOperations {
     const knownBlend = new Set(blendBefore.map(blendKey));
     const newBlendFaces = blendAfter.filter((face) => !knownBlend.has(blendKey(face)));
     if (afterBody.faces.length <= beforeBody.faces.length || blendAfter.length <= blendBefore.length) {
-      throw new Error(`Variable fillet reported success but the body topology did not change as a fillet would (faces ${beforeBody.faces.length} -> ${afterBody.faces.length}, blend faces ${blendBefore.length} -> ${blendAfter.length}); the native call was probably ignored. Check the document before relying on it`);
+      throw new Error(`Variable fillet reported success but the body topology did not change as a fillet would (faces ${beforeBody.faces.length} -> ${afterBody.faces.length}, blend faces ${blendBefore.length} -> ${blendAfter.length}); the native call was probably ignored. A history step may have been committed: check undo depth and Undo before retrying`);
     }
     return {
       ...after,
@@ -9042,8 +9057,8 @@ export class PlasticityOperations {
     if (maxSides !== undefined && (!Number.isInteger(maxSides) || maxSides < 3 || maxSides > 64)) throw new Error("OBJ maxSides must be an integer within 3..64");
     if (convex !== undefined && typeof convex !== "boolean") throw new Error("OBJ convex must be a boolean");
     if (density !== undefined && (!Number.isFinite(density) || density < 0 || density > 1)) throw new Error("OBJ density must be a finite number within 0..1");
-    if (maxWidthMm !== undefined && (!Number.isFinite(maxWidthMm) || maxWidthMm < 0 || maxWidthMm > 1000)) throw new Error("OBJ maxWidthMm must be a finite millimeter value within 0..1000 (unit and 0 = no limit are unverified)");
-    if (curveChordMaxMm !== undefined && (!Number.isFinite(curveChordMaxMm) || curveChordMaxMm < 0 || curveChordMaxMm > 1000)) throw new Error("OBJ curveChordMaxMm must be a finite millimeter value within 0..1000 (unit and 0 = no limit are unverified)");
+    if (maxWidthMm !== undefined && (!Number.isFinite(maxWidthMm) || maxWidthMm < 0 || maxWidthMm > 1000)) throw new Error("OBJ maxWidthMm must be a finite millimeter value within 0..1000 (millimetres, live-verified; 0 = no limit is unverified)");
+    if (curveChordMaxMm !== undefined && (!Number.isFinite(curveChordMaxMm) || curveChordMaxMm < 0 || curveChordMaxMm > 1000)) throw new Error("OBJ curveChordMaxMm must be a finite millimeter value within 0..1000 (millimetres, a maximum chord length, live-verified; 0 = no limit is unverified)");
     for (const key of ["curveChordToleranceMm", "surfacePlaneToleranceMm"] as const) {
       const value = meshOptions[key];
       if (value !== undefined && (!Number.isFinite(value) || value <= 0 || value > 10)) throw new Error(`OBJ ${key} must be a finite millimeter value within (0, 10]`);
@@ -9056,7 +9071,7 @@ export class PlasticityOperations {
       const value = meshOptions[key];
       if (value !== undefined && typeof value !== "boolean") throw new Error(`OBJ ${key} must be a boolean`);
     }
-    // The lock flags are unverified. "Lock" is assumed to mean the face value follows the edge value, so a lock with
+    // The lock flags are unverified (a live run wrote byte-identical files for true and false). "Lock" is assumed to mean the face value follows the edge value, so a lock with
     // different edge and face values has no defined winner: refuse it until a live test settles the semantics.
     if (meshOptions.lockPlaneTolerance === true
       && (meshOptions.curveChordToleranceMm ?? chordToleranceMm) !== (meshOptions.surfacePlaneToleranceMm ?? chordToleranceMm)) {
@@ -10267,7 +10282,8 @@ export class PlasticityOperations {
     requireReferenceMeshIds(state, ids);
     requirePolySplinesSourceMeshes(state, ids);
     const applied = normalizePolySplinesOptions(options);
-    const script = await this.runtime.mutate<{ readBack: Record<string, unknown> }>(`async function (Factory, Command, args) {
+    const script = await this.runtime.mutate<{ readBack: Record<string, unknown> }>(`async function (Factory, Command, isStudioLicense, hasXNurbs, args) {
+      ${studioLicenceGuard}
       if (this.executor.isBusy) throw new Error('Plasticity is busy');
       const editor = this;
       ${checkedFieldSetter}
@@ -10300,11 +10316,11 @@ export class PlasticityOperations {
       await editor.exec(command);
       if (failure) throw failure;
       return report ?? { readBack: {} };
-    }`, ["ConvertMeshToPolySplinesFactory", "PolySplinesCommand"], [{ ids, options: applied }], LONG_NATIVE_IMPORT_TIMEOUT_MS);
+    }`, ["ConvertMeshToPolySplinesFactory", "PolySplinesCommand", ...studioLicenceBindings], [{ ids, options: applied }], LONG_NATIVE_IMPORT_TIMEOUT_MS);
     const after = await this.state(LONG_NATIVE_IMPORT_TIMEOUT_MS);
     const polySplines = summarizeNewBodies(state, after);
     if (polySplines.count === 0) {
-      throw new Error("PolySplines finished without creating any body; Plasticity may have rejected the mesh (the converter needs a clean quad-dominant OBJ or FBX). Inspect the document before retrying");
+      throw new Error("PolySplines finished without creating any body; Plasticity may have rejected the mesh (the converter needs a clean quad-dominant OBJ or FBX). A history step may have been committed: check undo depth and Undo before retrying");
     }
     const outcome = judgePolySplinesOutcome(after, ids, polySplines.count);
     return { ...after, studio: { readBack: script?.readBack ?? {}, polySplines, outcome } };
@@ -10327,7 +10343,8 @@ export class PlasticityOperations {
     if (metadata.size === 0) throw new Error("PolySplines input must not be empty");
     if (extension === ".obj" && metadata.size > MAX_OBJ_BYTES) throw new Error("PolySplines OBJ input is excessively large");
     const applied = normalizePolySplinesOptions(options);
-    const script = await this.runtime.mutate<{ readBack: Record<string, unknown> }>(`async function (Factory, Command, args) {
+    const script = await this.runtime.mutate<{ readBack: Record<string, unknown> }>(`async function (Factory, Command, isStudioLicense, hasXNurbs, args) {
+      ${studioLicenceGuard}
       if (this.executor.isBusy) throw new Error('Plasticity is busy');
       const editor = this;
       ${checkedFieldSetter}
@@ -10354,11 +10371,11 @@ export class PlasticityOperations {
       await editor.exec(command);
       if (failure) throw failure;
       return report ?? { readBack: {} };
-    }`, ["ImportPolySplinesFactory", "ImportPolySplinesCommand"], [{ path: input, sourceUnit, options: applied }], LONG_NATIVE_IMPORT_TIMEOUT_MS);
+    }`, ["ImportPolySplinesFactory", "ImportPolySplinesCommand", ...studioLicenceBindings], [{ path: input, sourceUnit, options: applied }], LONG_NATIVE_IMPORT_TIMEOUT_MS);
     const after = await this.state(LONG_NATIVE_IMPORT_TIMEOUT_MS);
     const polySplines = summarizeNewBodies(state, after);
     if (polySplines.count === 0) {
-      throw new Error("PolySplines import finished without creating any body; check the file path/unit handling with a scratch file and inspect the document before retrying");
+      throw new Error("PolySplines import finished without creating any body; check the file path/unit handling with a scratch file. A history step may have been committed: check undo depth and Undo before retrying");
     }
     // The converter's input mesh count is unknown for a file import, so only a zero result can be judged here.
     const outcome: PolySplinesOutcome = { partial: false, inputMeshes: 0, outputBodies: polySplines.count, sourceMeshesRemaining: [], details: "File import: the number of meshes in the file is unknown, so a partial conversion cannot be detected; compare the bounds and body count with the source" };
@@ -10378,7 +10395,8 @@ export class PlasticityOperations {
     const normalized = normalizeXSidedOptions(edges, options);
     requireTopologySelection(state, edges.map(({ bodyId, edgeId }) => ({ bodyId, edgeId })), "edge");
     const loopCheck = checkClosedBoundary(state, edges);
-    const script = await this.runtime.mutate<{ readBack: Record<string, unknown> }>(`async function (Factory, Command, ContinuityType, args) {
+    const script = await this.runtime.mutate<{ readBack: Record<string, unknown> }>(`async function (Factory, Command, ContinuityType, isStudioLicense, hasXNurbs, args) {
+      ${studioLicenceGuard}
       ${findView}
       if (this.executor.isBusy) throw new Error('Plasticity is busy');
       const editor = this;
@@ -10462,7 +10480,7 @@ export class PlasticityOperations {
       await editor.exec(command);
       if (failure) throw failure;
       return report ?? { readBack: {} };
-    }`, ["XSidedFactory", "XNurbsCommand", "ContinuityType"], [{
+    }`, ["XSidedFactory", "XNurbsCommand", "ContinuityType", ...studioLicenceBindings], [{
       edges: edges.map(({ bodyId, edgeId, continuity }) => ({ bodyId, edgeId, ...(continuity !== undefined ? { continuity } : {}) })),
       continuity: normalized.continuity,
       fields: {

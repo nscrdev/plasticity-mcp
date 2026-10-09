@@ -62,6 +62,12 @@ test("PolySplines tools forward only the given options and report new bodies", a
     await client.callTool({ name: "plasticity_polysplines_from_reference_mesh", arguments: { referenceMeshIds: [4], revision: "r1" } });
     assert.deepEqual(received.convert, [[4], {}, "r1"]);
 
+    const zero = await client.callTool({ name: "plasticity_polysplines_from_reference_mesh", arguments: { referenceMeshIds: [0], revision: "r1" } });
+    assert.equal(zero.isError, undefined, "reference mesh id 0 is valid");
+    assert.deepEqual(received.convert, [[0], {}, "r1"]);
+    const negative = await client.callTool({ name: "plasticity_polysplines_from_reference_mesh", arguments: { referenceMeshIds: [-1], revision: "r1" } });
+    assert.equal(negative.isError, true);
+
     const imported = await client.callTool({ name: "plasticity_import_polysplines", arguments: { path: "/tmp/cage.obj", sourceUnit: "millimeter", roundedCorners: true, interpolateBoundary: true, revision: "r1" } });
     assert.equal(imported.isError, undefined, JSON.stringify(imported));
     assert.deepEqual(received.import, ["/tmp/cage.obj", "millimeter", { roundedCorners: true, interpolateBoundary: true }, "r1"]);

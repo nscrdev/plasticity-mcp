@@ -229,7 +229,7 @@ export function judgeXSidedOutcome(before: RuntimeState, after: RuntimeState, ed
     `modified bodies ${diff.modified.map((entry) => entry.id).join(", ") || "none"}`,
     `removed bodies ${diff.removed.map((body) => body.id).join(", ") || "none"}`,
   ].join("; ");
-  throw new Error(`X-sided fill did not create or extend a surface (${changed}). If undo depth rose, Plasticity pushed an empty history entry: inspect and Undo it`);
+  throw new Error(`X-sided fill did not create or extend a surface (${changed}). A history step may have been committed: check undo depth and Undo before retrying (an empty history entry may need an Undo)`);
 }
 
 export interface PolySplinesOutcome {

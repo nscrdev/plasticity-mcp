@@ -89,6 +89,20 @@ import {
   type WireSegmentReference,
 } from "./measurements.ts";
 import { MAX_REFERENCE_THREE_MF_ARCHIVE_BYTES, MAX_THREE_MF_ARCHIVE_BYTES, validateReferenceThreeMfArchive, validateThreeMfArchive, type ThreeMfValidation } from "./three-mf.ts";
+import {
+  checkClosedBoundary,
+  normalizePolySplinesOptions,
+  normalizeXSidedOptions,
+  requirePolySplinesSourceMeshes,
+  SHADER_MODE_NAMES,
+  SHADER_MODES,
+  summarizeNewBodies,
+  type PolySplinesOptions,
+  type ShaderModeName,
+  type ShaderModeResult,
+  type XSidedEdgeInput,
+  type XSidedOptions,
+} from "./studio-surfacing.ts";
 import { MAX_OBJ_BYTES, objMaterialLibraries, objSiblingStem, rewriteMtlTextureReferences, rewriteObjMaterialLibraries, validateObj, type ObjValidation } from "./obj.ts";
 import { serializeHiddenLineSvg, type HiddenLineProjectionSegment } from "./hiddenline-svg.ts";
 import { tessellateCurve } from "./svg-tessellation.ts";
@@ -351,6 +365,20 @@ const findView = `const find = id => {
     if (this.db.lookupStableId(versionId) === id) return item.view;
   }
   throw new Error('Unknown body ID: ' + id);
+};`;
+
+/**
+ * Sets a native factory field only when it exists, then reads it back. Used for fields whose names were
+ * inferred from the UI rather than a prototype accessor, so a wrong guess stops the call before commit.
+ */
+const checkedFieldSetter = `const setChecked = (factory, label, name, value) => {
+  if (!(name in factory)) throw new Error(label + ' has no ' + name + ' field in this Plasticity build; refusing to guess');
+  factory[name] = value;
+  const actual = factory[name];
+  const same = typeof value === 'number' && typeof actual === 'number'
+    ? Math.abs(actual - value) <= 1e-9 * Math.max(1, Math.abs(value))
+    : actual === value;
+  if (!same) throw new Error(label + '.' + name + ' did not accept ' + String(value) + ' (read back ' + String(actual) + ')');
 };`;
 
 const findFaceViews = `${findView}
@@ -10155,6 +10183,240 @@ export class PlasticityOperations {
     const missing = keys.filter((key) => !available.has(key));
     if (missing.length > 0) throw new Error(`Unknown current curve control point references: ${missing.join(", ")}`);
     return inventory;
+  }
+
+  /**
+   * EXPERIMENTAL. Convert reference meshes (OBJ or FBX origin) to G2 B-spline patch bodies with Plasticity's
+   * PolySplines converter. `ConvertMeshToPolySplinesFactory.empties` is a confirmed accessor; the option field
+   * names (roundedCorners, mergePatches, interpolateBoundary) come from the PolySplines dialog strings and are
+   * checked to exist and to read back before commit, otherwise the call fails without creating geometry.
+   */
+  async polySplinesFromReferenceMeshes(ids: number[], options: PolySplinesOptions, revision: string): Promise<RuntimeState> {
+    const state = await this.assertRevision(revision);
+    requireReferenceMeshIds(state, ids);
+    requirePolySplinesSourceMeshes(state, ids);
+    const applied = normalizePolySplinesOptions(options);
+    await this.runtime.mutate(`async function (Factory, Command, args) {
+      if (this.executor.isBusy) throw new Error('Plasticity is busy');
+      const editor = this;
+      ${checkedFieldSetter}
+      const empties = args.ids.map(id => {
+        const empty = this.db.lookupEmptyById(id);
+        if (empty?.constructor?.name !== 'Empties_ObjectEmpty') throw new Error('Unknown native reference mesh ID: ' + id);
+        return empty;
+      });
+      let failure;
+      const command = new Command(editor);
+      command.remember = false;
+      command.execute = async function () {
+        try {
+          const factory = new Factory(editor).resource(this);
+          for (const [name, value] of Object.entries(args.options)) setChecked(factory, 'ConvertMeshToPolySplinesFactory', name, value);
+          factory.empties = empties;
+          if (!Array.isArray(factory.empties) || factory.empties.length !== empties.length) {
+            throw new Error('ConvertMeshToPolySplinesFactory did not accept the reference meshes; refusing to commit');
+          }
+          return await factory.commit();
+        } catch (error) { failure = error; throw error; }
+      };
+      await editor.exec(command);
+      if (failure) throw failure;
+    }`, ["ConvertMeshToPolySplinesFactory", "PolySplinesCommand"], [{ ids, options: applied }], LONG_NATIVE_IMPORT_TIMEOUT_MS);
+    const after = await this.state(LONG_NATIVE_IMPORT_TIMEOUT_MS);
+    if (summarizeNewBodies(state, after).count === 0) {
+      throw new Error("PolySplines finished without creating any body; Plasticity may have rejected the mesh (the converter needs a clean quad-dominant OBJ or FBX). Inspect the document before retrying");
+    }
+    return after;
+  }
+
+  /**
+   * EXPERIMENTAL. Import an OBJ or FBX file straight to PolySplines patches through ImportPolySplinesFactory.
+   * Its input field names are inferred from the sibling import factories (`filePath`, `unit`): the script refuses
+   * to run when the factory has no `unit` field, and the call fails when no body appears.
+   */
+  async importPolySplines(inputPath: string, sourceUnit: NativeImportUnit, options: PolySplinesOptions, revision: string): Promise<RuntimeState> {
+    const state = await this.assertRevision(revision);
+    const input = await realpath(resolve(inputPath));
+    const extension = extname(input).toLowerCase();
+    if (extension === ".stl") throw new Error("PolySplines supports OBJ and FBX meshes, but not STL");
+    if (extension !== ".obj" && extension !== ".fbx") throw new Error("PolySplines input must end in .obj or .fbx");
+    const metadata = await stat(input);
+    if (!metadata.isFile()) throw new Error("PolySplines input must be a regular file");
+    if (metadata.size === 0) throw new Error("PolySplines input must not be empty");
+    const applied = normalizePolySplinesOptions(options);
+    await this.runtime.mutate(`async function (Factory, Command, args) {
+      if (this.executor.isBusy) throw new Error('Plasticity is busy');
+      const editor = this;
+      ${checkedFieldSetter}
+      let failure;
+      const command = new Command(editor);
+      command.remember = false;
+      command.execute = async function () {
+        try {
+          const factory = new Factory(editor).resource(this);
+          if (!('unit' in factory)) {
+            throw new Error('ImportPolySplinesFactory has no unit field in this Plasticity build, so the source unit cannot be honoured; import with plasticity_import_reference_mesh and run plasticity_polysplines_from_reference_mesh instead');
+          }
+          for (const [name, value] of Object.entries(args.options)) setChecked(factory, 'ImportPolySplinesFactory', name, value);
+          setChecked(factory, 'ImportPolySplinesFactory', 'unit', args.sourceUnit);
+          factory.filePath = args.path;
+          return await factory.commit();
+        } catch (error) { failure = error; throw error; }
+      };
+      await editor.exec(command);
+      if (failure) throw failure;
+    }`, ["ImportPolySplinesFactory", "ImportPolySplinesCommand"], [{ path: input, sourceUnit, options: applied }], LONG_NATIVE_IMPORT_TIMEOUT_MS);
+    const after = await this.state(LONG_NATIVE_IMPORT_TIMEOUT_MS);
+    if (summarizeNewBodies(state, after).count === 0) {
+      throw new Error("PolySplines import finished without creating any body; check the file path/unit handling with a scratch file and inspect the document before retrying");
+    }
+    return after;
+  }
+
+  /**
+   * EXPERIMENTAL. N-sided (XNurbs) fill over closed boundary edges with XSidedFactory. `edges` and the base
+   * XNurbs accessors (uDegree, vDegree, uSpans, vSpans, quadSided, tolerance, continuity) are confirmed
+   * accessors; their value units and the per-edge `setContinuityForEdge(edge, ContinuityType)` convention are
+   * inferred, so every value is read back after it is set and a mismatch aborts before commit.
+   */
+  async createXSidedSurface(edges: XSidedEdgeInput[], options: XSidedOptions, revision: string): Promise<RuntimeState> {
+    const state = await this.assertRevision(revision);
+    const normalized = normalizeXSidedOptions(edges, options);
+    requireTopologySelection(state, edges.map(({ bodyId, edgeId }) => ({ bodyId, edgeId })), "edge");
+    const loop = checkClosedBoundary(state, edges);
+    await this.runtime.mutate(`async function (Factory, Command, ContinuityType, args) {
+      ${findView}
+      if (this.executor.isBusy) throw new Error('Plasticity is busy');
+      const editor = this;
+      ${checkedFieldSetter}
+      const edgeViews = args.edges.map(reference => {
+        const view = find(reference.bodyId);
+        if (view?.constructor?.name !== 'Solid' && view?.constructor?.name !== 'Sheet') {
+          throw new Error('X-sided boundary edge belongs to a body that is no longer a Solid or Sheet');
+        }
+        const index = view.high.edges.versionIds.indexOf(reference.edgeId);
+        if (index < 0) throw new Error('Stale or unknown X-sided boundary edge: ' + reference.bodyId + ':' + reference.edgeId);
+        return view.high.edges.get(index);
+      });
+      const continuity = name => {
+        const value = ContinuityType[name];
+        if (value === undefined) throw new Error('Unknown ContinuityType ' + name);
+        return value;
+      };
+      let failure;
+      const command = new Command(editor);
+      command.remember = false;
+      command.execute = async function () {
+        try {
+          const factory = new Factory(editor).resource(this);
+          factory.edges = edgeViews;
+          if (!Array.isArray(factory.edges) || factory.edges.length !== edgeViews.length) {
+            throw new Error('XSidedFactory did not accept the boundary edges; refusing to commit');
+          }
+          for (const [name, value] of Object.entries(args.fields)) setChecked(factory, 'XSidedFactory', name, value);
+          if (args.continuity !== undefined) setChecked(factory, 'XSidedFactory', 'continuity', continuity(args.continuity));
+          args.edges.forEach((reference, index) => {
+            if (reference.continuity === undefined) return;
+            if (typeof factory.setContinuityForEdge !== 'function' || factory.setContinuityForEdge.length !== 2
+              || typeof factory.getContinuityForEdge !== 'function') {
+              throw new Error('XSidedFactory.setContinuityForEdge does not have the expected (edge, continuity) signature; refusing to guess');
+            }
+            const wanted = continuity(reference.continuity);
+            factory.setContinuityForEdge(edgeViews[index], wanted);
+            if (factory.getContinuityForEdge(edgeViews[index]) !== wanted) {
+              throw new Error('XSidedFactory did not apply ' + reference.continuity + ' to edge ' + reference.bodyId + ':' + reference.edgeId);
+            }
+          });
+          return await factory.commit();
+        } catch (error) { failure = error; throw error; }
+      };
+      await editor.exec(command);
+      if (failure) throw failure;
+    }`, ["XSidedFactory", "XNurbsCommand", "ContinuityType"], [{
+      edges: edges.map(({ bodyId, edgeId, continuity }) => ({ bodyId, edgeId, ...(continuity !== undefined ? { continuity } : {}) })),
+      continuity: normalized.continuity,
+      fields: {
+        ...(normalized.uDegree !== undefined ? { uDegree: normalized.uDegree } : {}),
+        ...(normalized.vDegree !== undefined ? { vDegree: normalized.vDegree } : {}),
+        ...(normalized.uSpans !== undefined ? { uSpans: normalized.uSpans } : {}),
+        ...(normalized.vSpans !== undefined ? { vSpans: normalized.vSpans } : {}),
+        ...(normalized.quadSided !== undefined ? { quadSided: normalized.quadSided } : {}),
+        ...(normalized.toleranceMm !== undefined ? { tolerance: millimetersToMeters(normalized.toleranceMm) } : {}),
+      },
+      loopChecked: loop.checked,
+    }], LONG_NATIVE_IMPORT_TIMEOUT_MS);
+    const after = await this.state(LONG_NATIVE_IMPORT_TIMEOUT_MS);
+    if (summarizeNewBodies(state, after).count === 0 && after.revision === state.revision) {
+      throw new Error("X-sided fill finished without changing the document; Plasticity may have found no solution for these boundary constraints");
+    }
+    return after;
+  }
+
+  /**
+   * EXPERIMENTAL. Read or switch the viewport shader mode (matcaps, isophotes, draft, zebra, topo, face direction)
+   * by activating the same button in Plasticity's Shader mode panel that a user clicks. The native
+   * ViewportShading.setShader(arity 2) arguments are not readable, so the DOM control is the only verified route.
+   * This is viewport state only: it must not change the document revision, and a changed revision is reported as an error.
+   */
+  async shaderMode(mode: ShaderModeName | undefined): Promise<ShaderModeResult> {
+    if (mode !== undefined && !(mode in SHADER_MODES)) throw new Error(`Unknown shader mode ${String(mode)}; use one of ${SHADER_MODE_NAMES.join(", ")}`);
+    const before = await this.state();
+    const byImage: Record<string, string> = {};
+    for (const [name, entry] of Object.entries(SHADER_MODES)) byImage[entry.image] = name;
+    const outcome = await this.runtime.read<{ previous: string | null; current: string | null; available: string[] }>(`async function (args) {
+      const scan = () => {
+        const entries = new Map();
+        for (const img of document.querySelectorAll('button img')) {
+          const src = (img.getAttribute('src') || '').split('?')[0];
+          const image = src.slice(src.lastIndexOf('/') + 1).replace(/[.]png$/i, '');
+          const name = args.byImage[image];
+          const button = img.closest('button');
+          if (name && button && !entries.has(name)) entries.set(name, button);
+        }
+        return entries;
+      };
+      const activeOf = entries => {
+        const active = [...entries].filter(([, button]) => button.getAttribute('data-state') === 'active').map(([name]) => name);
+        return active.length === 1 ? active[0] : null;
+      };
+      const settle = () => new Promise(resolve => setTimeout(resolve, 150));
+      let entries = scan();
+      if (entries.size === 0) {
+        throw new Error('Plasticity Shader mode panel is not mounted (no matcap buttons found); open the viewport settings sidebar and retry');
+      }
+      const previous = activeOf(entries);
+      if (args.mode !== undefined && previous !== args.mode) {
+        const button = entries.get(args.mode);
+        if (!button) throw new Error('Shader mode button is unavailable: ' + args.mode);
+        button.click();
+        await settle();
+        if (activeOf(scan()) !== args.mode) {
+          for (const type of ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click']) {
+            const Ctor = type.startsWith('pointer') ? PointerEvent : MouseEvent;
+            button.dispatchEvent(new Ctor(type, { bubbles: true, cancelable: true, view: window }));
+          }
+          await settle();
+        }
+        entries = scan();
+        if (activeOf(entries) !== args.mode) {
+          throw new Error('Plasticity did not activate shader mode ' + args.mode + '; the panel button click had no effect');
+        }
+        for (const viewport of this.viewports) viewport.setNeedsRender?.();
+      }
+      return { previous, current: activeOf(entries), available: [...entries.keys()] };
+    }`, [{ byImage, mode }]);
+    const after = await this.state();
+    if (after.revision !== before.revision) {
+      throw new Error(`Shader mode ${mode ?? "(read)"} changed the document revision (${before.revision} -> ${after.revision}); this is viewport state and should not. Inspect plasticity_changes_since and Undo history before continuing`);
+    }
+    return {
+      previous: outcome.previous as ShaderModeName | null,
+      current: outcome.current as ShaderModeName | null,
+      changed: outcome.previous !== outcome.current,
+      available: outcome.available as ShaderModeName[],
+      revisionBefore: before.revision,
+      revisionAfter: after.revision,
+    };
   }
 
   private async assertRevision(expected: string): Promise<RuntimeState> {

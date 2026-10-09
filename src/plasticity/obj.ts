@@ -71,10 +71,34 @@ export function rewriteObjMaterialLibraries(data: Buffer, renames: Map<string, s
     const base = name.split(/[\\/]/u).pop()!;
     const replacement = renames.get(base);
     if (replacement === undefined) return whole;
+    if (/\s/u.test(replacement)) throw new Error(`mtllib name ${JSON.stringify(replacement)} contains whitespace, which OBJ readers split into several libraries`);
     changed = true;
     return `${prefix}${replacement}${suffix}`;
   });
   return changed ? Buffer.from(rewritten, "utf8") : data;
+}
+
+/**
+ * Rewrites texture references (map_*, bump, disp, decal, refl) in MTL text when their basename appears in `renames`
+ * (old basename -> new basename). References to other files are left alone. Returns the input unchanged when nothing matched.
+ */
+export function rewriteMtlTextureReferences(data: Buffer, renames: Map<string, string>): Buffer {
+  const text = data.toString("utf8");
+  let changed = false;
+  const rewritten = text.replace(/^(\s*(?:map_[A-Za-z0-9_]+|bump|disp|decal|refl)\b[^\r\n]*?)(\S+)(\s*)$/gmu, (whole, prefix: string, name: string, suffix: string) => {
+    const base = name.split(/[\\/]/u).pop()!;
+    const replacement = renames.get(base);
+    if (replacement === undefined) return whole;
+    changed = true;
+    return `${prefix}${name.slice(0, name.length - base.length)}${replacement}${suffix}`;
+  });
+  return changed ? Buffer.from(rewritten, "utf8") : data;
+}
+
+/** Replaces whitespace runs so the name is a single token in `mtllib` lines. */
+export function objSiblingStem(stem: string): string {
+  const cleaned = stem.replace(/\s+/gu, "_");
+  return cleaned.length > 0 ? cleaned : "geometry";
 }
 
 export function validateObj(data: Buffer): ObjValidation {

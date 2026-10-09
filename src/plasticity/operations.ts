@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { constants } from "node:fs";
-import { copyFile, mkdir, mkdtemp, open, readdir, readFile, realpath, rm, rmdir, stat, writeFile } from "node:fs/promises";
+import { copyFile, lstat, mkdir, mkdtemp, open, readdir, readFile, realpath, rm, rmdir, stat, unlink, writeFile } from "node:fs/promises";
 import { basename, dirname, extname, join, resolve } from "node:path";
 
 import { LONG_NATIVE_IMPORT_TIMEOUT_MS, NATIVE_STATE_READ_TIMEOUT_MS, PlasticityRuntime, type RuntimeState } from "./runtime.ts";
@@ -89,7 +89,7 @@ import {
   type WireSegmentReference,
 } from "./measurements.ts";
 import { MAX_REFERENCE_THREE_MF_ARCHIVE_BYTES, MAX_THREE_MF_ARCHIVE_BYTES, validateReferenceThreeMfArchive, validateThreeMfArchive, type ThreeMfValidation } from "./three-mf.ts";
-import { MAX_OBJ_BYTES, objMaterialLibraries, rewriteObjMaterialLibraries, validateObj, type ObjValidation } from "./obj.ts";
+import { MAX_OBJ_BYTES, objMaterialLibraries, objSiblingStem, rewriteMtlTextureReferences, rewriteObjMaterialLibraries, validateObj, type ObjValidation } from "./obj.ts";
 import { serializeHiddenLineSvg, type HiddenLineProjectionSegment } from "./hiddenline-svg.ts";
 import { tessellateCurve } from "./svg-tessellation.ts";
 import { analyzeSvgEllipseArc, fitSvgConicEllipse, fitSvgEllipse } from "./svg-ellipse.ts";
@@ -493,6 +493,22 @@ export interface ObjFileResult extends ObjValidation {
   bytes: number;
   /** MTL (or any sibling) handling: siblings written by the native export are copied next to the OBJ. */
   mtl: { written: boolean; paths: string[]; mtllib: string[] };
+  siblingFiles: string[];
+}
+
+interface PublishItem {
+  to: string;
+  /** In-memory content; otherwise copied from `from`. */
+  data?: Buffer;
+  from?: string;
+}
+
+interface StagedObjFile {
+  output: string;
+  items: PublishItem[];
+  bytes: number;
+  validation: ObjValidation;
+  mtl: ObjFileResult["mtl"];
   siblingFiles: string[];
 }
 
@@ -8974,8 +8990,8 @@ export class PlasticityOperations {
     if (maxSides !== undefined && (!Number.isInteger(maxSides) || maxSides < 3 || maxSides > 64)) throw new Error("OBJ maxSides must be an integer within 3..64");
     if (convex !== undefined && typeof convex !== "boolean") throw new Error("OBJ convex must be a boolean");
     if (density !== undefined && (!Number.isFinite(density) || density < 0 || density > 1)) throw new Error("OBJ density must be a finite number within 0..1");
-    if (maxWidthMm !== undefined && (!Number.isFinite(maxWidthMm) || maxWidthMm < 0)) throw new Error("OBJ maxWidthMm must be a finite millimeter value >= 0");
-    if (curveChordMaxMm !== undefined && (!Number.isFinite(curveChordMaxMm) || curveChordMaxMm < 0)) throw new Error("OBJ curveChordMaxMm must be a finite millimeter value >= 0");
+    if (maxWidthMm !== undefined && (!Number.isFinite(maxWidthMm) || maxWidthMm < 0 || maxWidthMm > 1000)) throw new Error("OBJ maxWidthMm must be a finite millimeter value within 0..1000 (unit and 0 = no limit are unverified)");
+    if (curveChordMaxMm !== undefined && (!Number.isFinite(curveChordMaxMm) || curveChordMaxMm < 0 || curveChordMaxMm > 1000)) throw new Error("OBJ curveChordMaxMm must be a finite millimeter value within 0..1000 (unit and 0 = no limit are unverified)");
     for (const key of ["curveChordToleranceMm", "surfacePlaneToleranceMm"] as const) {
       const value = meshOptions[key];
       if (value !== undefined && (!Number.isFinite(value) || value <= 0 || value > 10)) throw new Error(`OBJ ${key} must be a finite millimeter value within (0, 10]`);
@@ -8987,6 +9003,16 @@ export class PlasticityOperations {
     for (const key of ["simplify", "lockPlaneTolerance", "lockAngleTolerance"] as const) {
       const value = meshOptions[key];
       if (value !== undefined && typeof value !== "boolean") throw new Error(`OBJ ${key} must be a boolean`);
+    }
+    // The lock flags are unverified. "Lock" is assumed to mean the face value follows the edge value, so a lock with
+    // different edge and face values has no defined winner: refuse it until a live test settles the semantics.
+    if (meshOptions.lockPlaneTolerance === true
+      && (meshOptions.curveChordToleranceMm ?? chordToleranceMm) !== (meshOptions.surfacePlaneToleranceMm ?? chordToleranceMm)) {
+      throw new Error("OBJ lockPlaneTolerance true needs equal edge and face tolerances (curveChordToleranceMm and surfacePlaneToleranceMm); lock semantics are unverified");
+    }
+    if (meshOptions.lockAngleTolerance === true
+      && (meshOptions.curveChordAngleDegrees ?? angleToleranceDegrees) !== (meshOptions.surfacePlaneAngleDegrees ?? angleToleranceDegrees)) {
+      throw new Error("OBJ lockAngleTolerance true needs equal edge and face angles (curveChordAngleDegrees and surfacePlaneAngleDegrees); lock semantics are unverified");
     }
     const perBody = exportOptions.perBody === true;
     const nativeOptions = {
@@ -9028,8 +9054,14 @@ export class PlasticityOperations {
       if (extname(output).toLowerCase() !== ".obj") throw new Error("OBJ output must end in .obj");
       await assertAbsent(output);
       await mkdir(dirname(output), { recursive: true });
-      const file = await this.exportObjFile(ids, output, nativeOptions);
-      return { ...file, ...common };
+      const stagings: string[] = [];
+      try {
+        const staged = await this.stageObjFile(ids, output, nativeOptions, stagings);
+        const [file] = await this.publishStagedObjFiles([staged]);
+        return { ...file!, ...common };
+      } finally {
+        await this.cleanupObjStaging(stagings);
+      }
     }
 
     if (extname(output).toLowerCase() === ".obj") throw new Error("OBJ perBody output must be a directory path, not a .obj file");
@@ -9037,79 +9069,124 @@ export class PlasticityOperations {
       .map((entry) => ({ ...entry, path: join(output, objBodyFileName(entry.name, entry.id)) }));
     for (const target of targets) await assertAbsent(target.path);
     await mkdir(output, { recursive: true });
-    const files: ObjExportResult[] = [];
-    for (const target of targets) {
-      const file = await this.exportObjFile([target.id], target.path, nativeOptions);
-      files.push({ ...file, ...common, bodyId: target.id, bodyName: target.name });
+    const stagings: string[] = [];
+    try {
+      // Stage every body first; nothing is published unless every body exported and validated.
+      const staged: StagedObjFile[] = [];
+      for (const target of targets) staged.push(await this.stageObjFile([target.id], target.path, nativeOptions, stagings));
+      const published = await this.publishStagedObjFiles(staged);
+      const files: ObjExportResult[] = published.map((file, index) => ({ ...file, ...common, bodyId: targets[index]!.id, bodyName: targets[index]!.name }));
+      return { perBody: true, directory: output, bodies: files.length, files, mtlWritten: files.some((file) => file.mtl.written), ...common };
+    } finally {
+      await this.cleanupObjStaging(stagings);
     }
-    return { perBody: true, directory: output, bodies: files.length, files, mtlWritten: files.some((file) => file.mtl.written), ...common };
   }
 
-  /** Exports one OBJ through a staging folder and publishes it, plus any sibling files such as a .mtl, next to `output`. */
-  private async exportObjFile(ids: number[], output: string, nativeOptions: Record<string, unknown>): Promise<ObjFileResult> {
+  private async cleanupObjStaging(stagings: string[]): Promise<void> {
+    // Keep the evidence when the runtime outcome is uncertain.
+    if (this.runtime.isUncertain()) return;
+    for (const staging of stagings) await rm(staging, { recursive: true, force: true }).catch(() => undefined);
+  }
+
+  /** Runs the native OBJ export into a private staging folder, validates it and plans the published files. Publishes nothing. */
+  private async stageObjFile(ids: number[], output: string, nativeOptions: Record<string, unknown>, stagings: string[]): Promise<StagedObjFile> {
     const staging = await mkdtemp(join(dirname(output), ".plasticity-obj-"));
+    stagings.push(staging);
     const temporary = join(staging, "geometry.obj");
-    try {
-      await this.runtime.mutate(`async function (Factory, args) {
-        ${findView}
-        if (this.executor.isBusy) throw new Error('Plasticity is busy');
-        const factory = new Factory(this);
-        factory.shells = args.ids.map(find);
-        factory.filePath = args.path;
-        factory.unit = 'millimeter';
-        factory.scale = 1;
-        factory.upAxis = 'z';
-        factory.showWireframe = false;
-        factory.simplify = args.simplify ?? false;
-        if (args.lockPlaneTolerance !== undefined) factory.lockPlaneTolerance = args.lockPlaneTolerance;
-        if (args.lockAngleTolerance !== undefined) factory.lockAngleTolerance = args.lockAngleTolerance;
-        factory.curveChordTolerance = args.curveChordTolerance ?? args.chordTolerance;
-        factory.surfacePlaneTolerance = args.surfacePlaneTolerance ?? args.chordTolerance;
-        factory.curveChordAngleDegrees = args.curveChordAngleDegrees ?? args.angleToleranceDegrees;
-        factory.surfacePlaneAngleDegrees = args.surfacePlaneAngleDegrees ?? args.angleToleranceDegrees;
-        if (args.planeAngleDegrees !== undefined) factory.planeAngleDegrees = args.planeAngleDegrees;
-        if (args.maxSides !== undefined) factory.maxSides = args.maxSides;
-        if (args.convex !== undefined) factory.convex = args.convex;
-        if (args.density !== undefined) factory.density = args.density;
-        if (args.maxWidth !== undefined) factory.maxWidth = args.maxWidth;
-        if (args.curveChordMax !== undefined) factory.curveChordMax = args.curveChordMax;
-        await factory.commit();
-      }`, ["OBJExportFactory"], [{ ids, path: temporary, ...nativeOptions }]);
-      const temporarySize = (await stat(temporary)).size;
-      if (temporarySize === 0 || temporarySize > MAX_OBJ_BYTES) throw new Error("Plasticity produced an empty or excessively large OBJ file");
-      const original = await readFile(temporary);
-      const validation = validateObj(original);
-      const stem = basename(output, extname(output));
-      const siblings = (await readdir(staging)).filter((name) => name !== "geometry.obj").sort();
-      const renames = new Map<string, string>();
-      const siblingTargets = siblings.map((name) => {
-        const renamed = `${stem}${extname(name)}`;
-        renames.set(name, renamed);
-        return { from: join(staging, name), to: join(dirname(output), renamed) };
-      });
-      if (new Set(siblingTargets.map((target) => target.to)).size !== siblingTargets.length) throw new Error("Plasticity wrote several sibling files with the same extension; refusing to rename them onto one path");
-      for (const target of siblingTargets) await assertAbsent(target.to);
-      const data = rewriteObjMaterialLibraries(original, renames);
-      if (data === original) await copyFile(temporary, output, constants.COPYFILE_EXCL);
-      else await writeFile(output, data, { flag: "wx" });
-      for (const target of siblingTargets) await copyFile(target.from, target.to, constants.COPYFILE_EXCL);
-      const materialLibraries = objMaterialLibraries(data);
-      return {
-        path: output,
-        bytes: data.length,
-        ...validation,
-        mtl: {
-          written: siblings.some((name) => extname(name).toLowerCase() === ".mtl"),
-          paths: siblingTargets.filter((target) => extname(target.to).toLowerCase() === ".mtl").map((target) => target.to),
-          mtllib: materialLibraries,
-        },
-        siblingFiles: siblingTargets.map((target) => target.to),
-      };
-    } finally {
-      if (!this.runtime.isUncertain()) {
-        await rm(staging, { recursive: true, force: true }).catch(() => undefined);
+    await this.runtime.mutate(`async function (Factory, args) {
+      ${findView}
+      if (this.executor.isBusy) throw new Error('Plasticity is busy');
+      const factory = new Factory(this);
+      factory.shells = args.ids.map(find);
+      factory.filePath = args.path;
+      factory.unit = 'millimeter';
+      factory.scale = 1;
+      factory.upAxis = 'z';
+      factory.showWireframe = false;
+      factory.simplify = args.simplify ?? false;
+      if (args.lockPlaneTolerance !== undefined) factory.lockPlaneTolerance = args.lockPlaneTolerance;
+      if (args.lockAngleTolerance !== undefined) factory.lockAngleTolerance = args.lockAngleTolerance;
+      factory.curveChordTolerance = args.curveChordTolerance ?? args.chordTolerance;
+      factory.surfacePlaneTolerance = args.surfacePlaneTolerance ?? args.chordTolerance;
+      factory.curveChordAngleDegrees = args.curveChordAngleDegrees ?? args.angleToleranceDegrees;
+      factory.surfacePlaneAngleDegrees = args.surfacePlaneAngleDegrees ?? args.angleToleranceDegrees;
+      if (args.planeAngleDegrees !== undefined) factory.planeAngleDegrees = args.planeAngleDegrees;
+      if (args.maxSides !== undefined) factory.maxSides = args.maxSides;
+      if (args.convex !== undefined) factory.convex = args.convex;
+      if (args.density !== undefined) factory.density = args.density;
+      if (args.maxWidth !== undefined) factory.maxWidth = args.maxWidth;
+      if (args.curveChordMax !== undefined) factory.curveChordMax = args.curveChordMax;
+      await factory.commit();
+    }`, ["OBJExportFactory"], [{ ids, path: temporary, ...nativeOptions }]);
+    const temporarySize = (await stat(temporary)).size;
+    if (temporarySize === 0 || temporarySize > MAX_OBJ_BYTES) throw new Error("Plasticity produced an empty or excessively large OBJ file");
+    const original = await readFile(temporary);
+    const validation = validateObj(original);
+    const stem = objSiblingStem(basename(output, extname(output)));
+    const siblings = (await readdir(staging)).filter((name) => name !== "geometry.obj").sort();
+    for (const name of siblings) {
+      const info = await lstat(join(staging, name));
+      if (!info.isFile()) throw new Error(`Plasticity wrote a sibling that is not a regular file (${name}); refusing to publish`);
+    }
+    const renames = new Map<string, string>();
+    const siblingTargets = siblings.map((name) => {
+      const renamed = `${stem}${extname(name)}`;
+      renames.set(name, renamed);
+      return { name, from: join(staging, name), to: join(dirname(output), renamed) };
+    });
+    if (new Set(siblingTargets.map((target) => target.to)).size !== siblingTargets.length) throw new Error("Plasticity wrote several sibling files with the same extension; refusing to rename them onto one path");
+    const items: PublishItem[] = [];
+    for (const target of siblingTargets) {
+      if (extname(target.name).toLowerCase() === ".mtl") {
+        const mtl = await readFile(target.from);
+        items.push({ to: target.to, data: rewriteMtlTextureReferences(mtl, renames) });
+      } else {
+        items.push({ to: target.to, from: target.from });
       }
     }
+    const data = rewriteObjMaterialLibraries(original, renames);
+    // The OBJ goes last so that its presence means every sibling was published.
+    items.push(data === original ? { to: output, from: temporary } : { to: output, data });
+    return {
+      output,
+      items,
+      bytes: data.length,
+      validation,
+      mtl: {
+        written: siblings.some((name) => extname(name).toLowerCase() === ".mtl"),
+        paths: siblingTargets.filter((target) => extname(target.to).toLowerCase() === ".mtl").map((target) => target.to),
+        mtllib: objMaterialLibraries(data),
+      },
+      siblingFiles: siblingTargets.map((target) => target.to),
+    };
+  }
+
+  /**
+   * Publishes every staged file of every export, or none: all target paths are checked first, files are written
+   * exclusively, and anything this call created is removed again when a write fails.
+   */
+  private async publishStagedObjFiles(staged: StagedObjFile[]): Promise<ObjFileResult[]> {
+    const items = staged.flatMap((entry) => entry.items);
+    if (new Set(items.map((item) => item.to)).size !== items.length) throw new Error("OBJ export would write the same target file twice; refusing");
+    for (const item of items) await assertAbsent(item.to);
+    const created: string[] = [];
+    try {
+      for (const item of items) {
+        if (item.data !== undefined) await writeFile(item.to, item.data, { flag: "wx" });
+        else await copyFile(item.from!, item.to, constants.COPYFILE_EXCL);
+        created.push(item.to);
+      }
+    } catch (error) {
+      for (const path of created) await unlink(path).catch(() => undefined);
+      throw error;
+    }
+    return staged.map((entry) => ({
+      path: entry.output,
+      bytes: entry.bytes,
+      ...entry.validation,
+      mtl: entry.mtl,
+      siblingFiles: entry.siblingFiles,
+    }));
   }
 
   async exportSvg(ids: number[], outputPath: string, revision: string, curveChordToleranceMm = 0.05, curveChordAngleDegrees = 5): Promise<{

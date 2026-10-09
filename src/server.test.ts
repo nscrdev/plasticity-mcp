@@ -1561,7 +1561,7 @@ test("MCP validates and forwards native OBJ export parameters", async () => {
     } });
     assert.equal(quad.isError, undefined);
     assert.deepEqual(received, [[7], "/tmp/part.obj", "r1", 0.05, 15, { maxSides: 4, convex: false, density: 0.5, maxWidthMm: 0, curveChordMaxMm: 0.1 }, { perBody: false }]);
-    for (const bad of [{ maxSides: 2 }, { maxSides: 65 }, { maxSides: 4.5 }, { density: 2 }, { maxWidthMm: -1 }, { curveChordMaxMm: -0.1 }, { convex: "yes" }]) {
+    for (const bad of [{ maxSides: 2 }, { maxSides: 65 }, { maxSides: 4.5 }, { density: 2 }, { maxWidthMm: -1 }, { maxWidthMm: 1001 }, { curveChordMaxMm: 1001 }, { curveChordMaxMm: -0.1 }, { convex: "yes" }]) {
       const rejected = await client.callTool({ name: "plasticity_export_obj", arguments: { ids: [7], path: "/tmp/part.obj", revision: "r1", ...bad } });
       assert.equal(rejected.isError, true, JSON.stringify(bad));
     }

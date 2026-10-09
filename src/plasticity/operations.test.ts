@@ -156,6 +156,7 @@ test("OBJ mesh options are validated and reach the factory only when given", asy
       [{ maxSides: 2 }, /maxSides/u], [{ maxSides: 65 }, /maxSides/u], [{ maxSides: 4.5 }, /maxSides/u],
       [{ density: 1.1 }, /density/u], [{ density: Number.NaN }, /density/u],
       [{ maxWidthMm: -1 }, /maxWidthMm/u], [{ curveChordMaxMm: Number.POSITIVE_INFINITY }, /curveChordMaxMm/u],
+      [{ maxWidthMm: 1001 }, /maxWidthMm/u], [{ curveChordMaxMm: 1000.5 }, /curveChordMaxMm/u],
     ] as const) {
       await assert.rejects(operations.exportObj([7], join(root, "bad.obj"), "r", 0.05, 15, options), pattern);
     }
@@ -210,7 +211,7 @@ test("OBJ edge, face, plane and lock options map to the factory only when given"
 
     const result = await operations.exportObj([7], join(root, "tol.obj"), "r", 0.05, 15, {
       simplify: true, curveChordToleranceMm: 0.01, surfacePlaneToleranceMm: 0.2, curveChordAngleDegrees: 5, surfacePlaneAngleDegrees: 20,
-      planeAngleDegrees: 3, lockPlaneTolerance: true, lockAngleTolerance: false,
+      planeAngleDegrees: 3, lockPlaneTolerance: false, lockAngleTolerance: false,
     });
     const args = values?.[0] as Record<string, unknown>;
     assert.equal(args.simplify, true);
@@ -221,12 +222,17 @@ test("OBJ edge, face, plane and lock options map to the factory only when given"
     assert.equal(args.surfacePlaneAngleDegrees, 20);
     assert.equal(args.angleToleranceDegrees, 15);
     assert.equal(args.planeAngleDegrees, 3);
-    assert.equal(args.lockPlaneTolerance, true);
+    assert.equal(args.lockPlaneTolerance, false);
     assert.equal(args.lockAngleTolerance, false);
     assert.deepEqual(result.meshOptions, {
       maxSides: 3, simplify: true, curveChordToleranceMm: 0.01, surfacePlaneToleranceMm: 0.2, curveChordAngleDegrees: 5,
-      surfacePlaneAngleDegrees: 20, planeAngleDegrees: 3, lockPlaneTolerance: true, lockAngleTolerance: false,
+      surfacePlaneAngleDegrees: 20, planeAngleDegrees: 3, lockPlaneTolerance: false, lockAngleTolerance: false,
     });
+    // Lock true is refused when edge and face values differ (semantics unverified), accepted when they agree.
+    await assert.rejects(operations.exportObj([7], join(root, "lock-bad.obj"), "r", 0.05, 15, { lockPlaneTolerance: true, curveChordToleranceMm: 0.01 }), /lockPlaneTolerance true needs equal/u);
+    await assert.rejects(operations.exportObj([7], join(root, "lock-bad2.obj"), "r", 0.05, 15, { lockAngleTolerance: true, surfacePlaneAngleDegrees: 20 }), /lockAngleTolerance true needs equal/u);
+    await operations.exportObj([7], join(root, "lock-ok.obj"), "r", 0.05, 15, { lockPlaneTolerance: true, lockAngleTolerance: true, curveChordToleranceMm: 0.2, surfacePlaneToleranceMm: 0.2 });
+    assert.equal((values?.[0] as Record<string, unknown>).lockPlaneTolerance, true);
   } finally {
     await rm(root, { recursive: true, force: true });
   }

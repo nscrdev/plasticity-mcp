@@ -63,7 +63,7 @@ test("an all-quad mesh reports zero triangle faces and n-gons", () => {
   assert.deepEqual([result.triangleFaces, result.quads, result.ngons], [0, 1, 0]);
 });
 
-import { objMaterialLibraries, rewriteObjMaterialLibraries } from "./obj.ts";
+import { objMaterialLibraries, objSiblingStem, rewriteMtlTextureReferences, rewriteObjMaterialLibraries } from "./obj.ts";
 
 test("reports per-object counts and bounds when several o groups exist", () => {
   const result = validateObj(Buffer.from(`mtllib geometry.mtl
@@ -98,5 +98,20 @@ test("lists and rewrites mtllib references without touching other bytes", () => 
   const rewritten = rewriteObjMaterialLibraries(data, new Map([["geometry.mtl", "stick.mtl"]]));
   assert.equal(rewritten.toString(), "# c\r\nmtllib stick.mtl\r\no A\r\nv 0 0 0\r\n");
   assert.equal(rewriteObjMaterialLibraries(data, new Map([["other.mtl", "x.mtl"]])), data);
-  assert.equal(rewriteObjMaterialLibraries(Buffer.from("mtllib /tmp/x/geometry.mtl\n"), new Map([["geometry.mtl", "a b.mtl"]])).toString(), "mtllib a b.mtl\n");
+  assert.equal(rewriteObjMaterialLibraries(Buffer.from("mtllib /tmp/x/geometry.mtl\n"), new Map([["geometry.mtl", "a_b.mtl"]])).toString(), "mtllib a_b.mtl\n");
+  // A name with whitespace would be read as two libraries; the rewriter refuses to write it.
+  assert.throws(() => rewriteObjMaterialLibraries(Buffer.from("mtllib geometry.mtl\n"), new Map([["geometry.mtl", "a b.mtl"]])), /whitespace/u);
+});
+
+test("sibling stems never contain whitespace", () => {
+  assert.equal(objSiblingStem("my part"), "my_part");
+  assert.equal(objSiblingStem("a\tb  c"), "a_b_c");
+  assert.equal(objSiblingStem("plain"), "plain");
+});
+
+test("rewrites MTL texture references only when they name a renamed staging file", () => {
+  const mtl = Buffer.from("newmtl m\nmap_Kd geometry.png\nmap_Bump -bm 1 geometry.png\nmap_Ks other.png\nKd 1 0 0\n");
+  const out = rewriteMtlTextureReferences(mtl, new Map([["geometry.png", "stick.png"]])).toString();
+  assert.equal(out, "newmtl m\nmap_Kd stick.png\nmap_Bump -bm 1 stick.png\nmap_Ks other.png\nKd 1 0 0\n");
+  assert.equal(rewriteMtlTextureReferences(mtl, new Map([["x.png", "y.png"]])), mtl);
 });

@@ -405,8 +405,10 @@ const verifyFields = (factory, label, expected) => {
  * injected scripts check these two zero-argument native functions first. Only the booleans are inspected; no
  * licence value is returned or logged.
  */
-const studioLicenceBindings = ["isStudioLicense", "hasXNurbs"];
-const studioLicenceGuard = `if (isStudioLicense() !== true) throw new Error('Plasticity Studio licence not active (isStudioLicense false)');
+const studioLicenceBindings = ["isStudioLicense"];
+const studioLicenceGuard = `if (isStudioLicense() !== true) throw new Error('Plasticity Studio licence not active (isStudioLicense false)');`;
+const xNurbsLicenceBindings = ["isStudioLicense", "hasXNurbs"];
+const xNurbsLicenceGuard = `${studioLicenceGuard}
 if (hasXNurbs() !== true) throw new Error('Plasticity Studio licence not active (hasXNurbs false)');`;
 
 const findFaceViews = `${findView}
@@ -5014,7 +5016,7 @@ export class PlasticityOperations {
   }
 
   /**
-   * REFUSED for now (see the guard in the body): the native addVariationPoint rejects a position object.
+   * REFUSED for now (see the guard in the body): the native addVariationPoint appears to reject a position object (it throws in lookupTopologyItem).
    * EXPERIMENTAL variable-radius fillet, refused unless `experimental: true`. UNVERIFIED against the live app:
    * `addVariationPoint` has declared arity 2 and the argument order (point, radius) in metres is inferred, not read.
    * Every variation point is resolved to a native edge position (the `position` object of GetPointAndTangent) by
@@ -5024,11 +5026,11 @@ export class PlasticityOperations {
    */
   async filletVariable(id: number, edgeIds: string[], radiusMm: number, points: VariableFilletPoint[], revision: string, options: { experimental?: boolean; assumeNativeSignature?: boolean } = {}): Promise<RuntimeState & { experimental?: ExperimentalVariableFilletReport }> {
     if (options.experimental !== true) throw new Error("plasticity_fillet_variable is EXPERIMENTAL and unverified against the live app; pass experimental: true to use it");
-    // Live test: the native addVariationPoint expects a topology item, not the position object passed below, and
+    // Live test: the native addVariationPoint appears to expect a topology item, not the position object passed below, and
     // throws inside lookupTopologyItem. The arity check cannot catch that, so refuse before any runtime call
     // (the document stays untouched). `assumeNativeSignature` is not exposed by the server; it only lets tests
     // exercise the script below until the real native argument is known.
-    if (options.assumeNativeSignature !== true) throw new Error("variable fillet not supported yet: native addVariationPoint signature unknown (it expects a topology item, not a point); no native call was made and the document is untouched");
+    if (options.assumeNativeSignature !== true) throw new Error("variable fillet not supported yet: native addVariationPoint signature unknown (it appears to expect a topology item, not a point); no native call was made and the document is untouched");
     const before = await this.assertRevision(revision);
     if (!Number.isFinite(radiusMm) || radiusMm <= 0) throw new Error("Variable fillet base radiusMm must be a positive finite millimeter value");
     if (points.length === 0) throw new Error("Variable fillet needs at least one variation point");
@@ -10282,7 +10284,7 @@ export class PlasticityOperations {
     requireReferenceMeshIds(state, ids);
     requirePolySplinesSourceMeshes(state, ids);
     const applied = normalizePolySplinesOptions(options);
-    const script = await this.runtime.mutate<{ readBack: Record<string, unknown> }>(`async function (Factory, Command, isStudioLicense, hasXNurbs, args) {
+    const script = await this.runtime.mutate<{ readBack: Record<string, unknown> }>(`async function (Factory, Command, isStudioLicense, args) {
       ${studioLicenceGuard}
       if (this.executor.isBusy) throw new Error('Plasticity is busy');
       const editor = this;
@@ -10343,7 +10345,7 @@ export class PlasticityOperations {
     if (metadata.size === 0) throw new Error("PolySplines input must not be empty");
     if (extension === ".obj" && metadata.size > MAX_OBJ_BYTES) throw new Error("PolySplines OBJ input is excessively large");
     const applied = normalizePolySplinesOptions(options);
-    const script = await this.runtime.mutate<{ readBack: Record<string, unknown> }>(`async function (Factory, Command, isStudioLicense, hasXNurbs, args) {
+    const script = await this.runtime.mutate<{ readBack: Record<string, unknown> }>(`async function (Factory, Command, isStudioLicense, args) {
       ${studioLicenceGuard}
       if (this.executor.isBusy) throw new Error('Plasticity is busy');
       const editor = this;
@@ -10396,7 +10398,7 @@ export class PlasticityOperations {
     requireTopologySelection(state, edges.map(({ bodyId, edgeId }) => ({ bodyId, edgeId })), "edge");
     const loopCheck = checkClosedBoundary(state, edges);
     const script = await this.runtime.mutate<{ readBack: Record<string, unknown> }>(`async function (Factory, Command, ContinuityType, isStudioLicense, hasXNurbs, args) {
-      ${studioLicenceGuard}
+      ${xNurbsLicenceGuard}
       ${findView}
       if (this.executor.isBusy) throw new Error('Plasticity is busy');
       const editor = this;
@@ -10480,7 +10482,7 @@ export class PlasticityOperations {
       await editor.exec(command);
       if (failure) throw failure;
       return report ?? { readBack: {} };
-    }`, ["XSidedFactory", "XNurbsCommand", "ContinuityType", ...studioLicenceBindings], [{
+    }`, ["XSidedFactory", "XNurbsCommand", "ContinuityType", ...xNurbsLicenceBindings], [{
       edges: edges.map(({ bodyId, edgeId, continuity }) => ({ bodyId, edgeId, ...(continuity !== undefined ? { continuity } : {}) })),
       continuity: normalized.continuity,
       fields: {

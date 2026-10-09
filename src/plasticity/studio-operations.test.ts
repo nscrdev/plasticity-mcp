@@ -492,15 +492,28 @@ test("shader mode refuses while Plasticity is busy", async () => {
 
 test("Studio tools refuse with a clear licence error before touching the factory when the licence is not Studio", async () => {
   const obj = baseState({ referenceMeshes: [mesh(5, "obj")] });
-  for (const [licence, message] of [
-    [{ isStudioLicense: () => false, hasXNurbs: () => true }, /Plasticity Studio licence not active \(isStudioLicense false\)/u],
-    [{ isStudioLicense: () => true, hasXNurbs: () => false }, /Plasticity Studio licence not active \(hasXNurbs false\)/u],
-  ] as const) {
+  const root = await mkdtemp(join(tmpdir(), "polysplines-licence-"));
+  try {
+    const file = join(root, "cage.obj");
+    await writeFile(file, "v 0 0 0\n");
     const created: any[] = [];
-    const convert = harness([obj, obj], { bindings: { ...licence, ConvertMeshToPolySplinesFactory: polySplinesFactory(created, "ok"), PolySplinesCommand: FakeCommand }, editor: polySplinesEditor([5]) });
-    await assert.rejects(convert.operations.polySplinesFromReferenceMeshes([5], {}, "r1"), message);
+    // isStudioLicense false, non-boolean or throwing refuses all three tools (fails closed).
+    for (const isStudioLicense of [() => false, () => undefined, () => { throw new Error("binding broke"); }]) {
+      const licence = { isStudioLicense, hasXNurbs: () => true };
+      const convert = harness([obj, obj], { bindings: { ...licence, ConvertMeshToPolySplinesFactory: polySplinesFactory(created, "ok"), PolySplinesCommand: FakeCommand }, editor: polySplinesEditor([5]) });
+      await assert.rejects(convert.operations.polySplinesFromReferenceMeshes([5], {}, "r1"), /Plasticity Studio licence not active|binding broke/u);
+      const imported = harness([baseState(), baseState()], { bindings: { ...licence, ImportPolySplinesFactory: importFactory(created, "ok"), ImportPolySplinesCommand: FakeCommand }, editor: () => ({ executor: { isBusy: false }, ...execOnly }) });
+      await assert.rejects(imported.operations.importPolySplines(file, "millimeter", {}, "r1"), /Plasticity Studio licence not active|binding broke/u);
+      const xsided = harness([xsidedBefore(), xsidedBefore()], { bindings: { ...licence, XSidedFactory: xsidedFactory(created, "ok"), XNurbsCommand: FakeCommand, ContinuityType: CONTINUITY }, editor: sheetEditor(4) });
+      await assert.rejects(xsided.operations.createXSidedSurface(loop(4), {}, "r1"), /Plasticity Studio licence not active|binding broke/u);
+    }
+    // hasXNurbs false refuses only X-sided; PolySplines needs isStudioLicense alone.
+    const licence = { isStudioLicense: () => true, hasXNurbs: () => false };
     const xsided = harness([xsidedBefore(), xsidedBefore()], { bindings: { ...licence, XSidedFactory: xsidedFactory(created, "ok"), XNurbsCommand: FakeCommand, ContinuityType: CONTINUITY }, editor: sheetEditor(4) });
-    await assert.rejects(xsided.operations.createXSidedSurface(loop(4), {}, "r1"), message);
-    assert.equal(created.length, 0, "no factory is constructed on a refused licence");
-  }
+    await assert.rejects(xsided.operations.createXSidedSurface(loop(4), {}, "r1"), /\(hasXNurbs false\)/u);
+    const after = baseState({ revision: "r2", referenceMeshes: [mesh(5, "obj")], bodies: [sheet(9, 4)] });
+    const convert = harness([obj, after], { bindings: { ...licence, ConvertMeshToPolySplinesFactory: polySplinesFactory(created, "ok"), PolySplinesCommand: FakeCommand }, editor: polySplinesEditor([5]) });
+    await convert.operations.polySplinesFromReferenceMeshes([5], {}, "r1");
+    assert.equal(created.length, 1, "only the allowed PolySplines convert built a factory");
+  } finally { await rm(root, { recursive: true, force: true }); }
 });

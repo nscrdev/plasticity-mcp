@@ -18,22 +18,19 @@
 ### Fixes from live testing (Plasticity 26.1.3 Studio)
 
 - `plasticity_polysplines_from_reference_mesh` now accepts reference mesh id 0 (`referenceMeshIds` is nonnegative, as for the other reference mesh tools).
-- Studio tools (PolySplines convert, import PolySplines, X-sided) check the native `isStudioLicense()` and `hasXNurbs()` before any native call and fail with "Plasticity Studio licence not active (isStudioLicense false)" (or `hasXNurbs false`) instead of a bare native "Error" on an Indie licence. Only these two booleans are inspected.
+- Studio tools check the native licence functions before any factory or command is created and fail with "Plasticity Studio licence not active (isStudioLicense false)" instead of a bare native "Error" on an Indie licence. PolySplines convert and import check `isStudioLicense()`; X-sided also checks `hasXNurbs()` (reported as `hasXNurbs false`). Only these booleans are inspected.
 - `plasticity_fillet_variable` is now refused before any native call ("variable fillet not supported yet: native addVariationPoint signature unknown"). A live test showed the native `addVariationPoint` expects a topology item, not the position object this tool passed, and throws. The document is left untouched.
 - Descriptions now say: PolySplines `mergePatches`, `roundedCorners` and `interpolateBoundary` are UNVERIFIED (live A/B on a 1448-quad cage gave identical face count and bounds); OBJ lock flags gave byte-identical files for true and false; `curveChordMaxMm` is a maximum chord LENGTH in mm and `maxWidthMm` is in mm (both live-verified); the native chamfer default behaves like Apex, not Offset (pass `mode: "offset"` for Offset); X-sided `uDegree`, `vDegree`, `uSpans` and `vSpans` read back but are not honoured by the committed surface (5x5 degree, 1x1 spans in a planar hole), G2 failed with native error 30 there, and X-sided `sizeMm` and body bounds report the untrimmed surface plus tolerance, not the trimmed patch.
 - Post-commit guard failures (variable fillet, PolySplines, X-sided) now say a history step may have been committed and to check undo depth and Undo before retrying.
 
 ### Live-verified status
 
-Live-verified: none of the new options. Earlier live runs exercised only `maxSides`, `convex` (no visible effect on quad output) and the shared tolerances. The live tests below (numbering from the independent review) would confirm:
+Live run 2026-10-09 on Plasticity 26.1.3 (Studio licence), details in the section above and the notes below:
 
-- L1 lock flags: the native value type of `lockPlaneTolerance` / `lockAngleTolerance`, and whether "lock" means the face value follows the edge value. Until then the schema stays boolean and lock `true` with differing values is refused.
-- L2 `maxWidthMm` / `curveChordMaxMm`: that they are in metres as sent (mm in the API), that `0` means no limit, and what they do to face and chord counts.
-- L3 MTL: that Plasticity writes an `.mtl` beside the staging OBJ, that `mtllib` and `usemtl` lines survive the copy and rename, and that Blender or Houdini load the materials.
-- L4 `perBody`: one `o` per file, name sanitising, and each file's bounds matching its body.
-- L5 two-distance chamfer: that legs measure `distanceMm` and `distance2Mm`, that the negative sign is right, and which face gets which distance per edge.
-- L6 apex chamfer: what `distanceMm` means in apex mode, and that `offset` equals no mode.
-- L7 variable fillet: the real argument order and type of `addVariationPoint`, that commit uses the variation points, and that the radii near the ends match the request.
+- Verified: `maxWidthMm` and `curveChordMaxMm` are millimetres (`curveChordMaxMm` is a maximum chord length); `perBody` (one `o` per file, sanitised names, bounds match); MTL written when a material exists (`usemtl` names are material UUIDs; loading in a DCC is not checked); two-distance chamfer (`distance1` lands on the first face of `faceIds`, `distance2` on the other); chamfer `mode` is applied; PolySplines convert of a cube and a 1448-quad cage; X-sided default, tolerance and 3 and 5 sided loops.
+- Not verified or no measurable effect: PolySplines `mergePatches`, `roundedCorners`, `interpolateBoundary`; OBJ lock flags (lock true and false gave identical files, but the guard forces equal values, so the run could not discriminate); X-sided `uDegree`, `vDegree`, `uSpans`, `vSpans` (not honoured) and G2 continuity (native error 30); `plasticity_import_polysplines` (refused, importer has no unit field).
+- Disproved: the native chamfer default behaves like Apex, not Offset.
+- Variable fillet: the native `addVariationPoint` appears to expect a topology item, so the tool is refused until the real argument is known.
 
 Known limits: two sibling files with the same extension abort the export after the native write; `perObject` keys on `o` only (`g` groups ignored); a `mtllib` line listing several libraries is not rewritten.
 

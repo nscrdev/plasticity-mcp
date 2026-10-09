@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { constants } from "node:fs";
-import { copyFile, mkdir, mkdtemp, open, readFile, realpath, rm, rmdir, stat, writeFile } from "node:fs/promises";
-import { dirname, extname, join, resolve } from "node:path";
+import { copyFile, mkdir, mkdtemp, open, readdir, readFile, realpath, rm, rmdir, stat, writeFile } from "node:fs/promises";
+import { basename, dirname, extname, join, resolve } from "node:path";
 
 import { LONG_NATIVE_IMPORT_TIMEOUT_MS, NATIVE_STATE_READ_TIMEOUT_MS, PlasticityRuntime, type RuntimeState } from "./runtime.ts";
 import { add, ConstructionGeometry, cross, dot, frameFromOriginNormalX, localPointToWorld, normalize, scale, subtract } from "./construction.ts";
@@ -89,7 +89,7 @@ import {
   type WireSegmentReference,
 } from "./measurements.ts";
 import { MAX_REFERENCE_THREE_MF_ARCHIVE_BYTES, MAX_THREE_MF_ARCHIVE_BYTES, validateReferenceThreeMfArchive, validateThreeMfArchive, type ThreeMfValidation } from "./three-mf.ts";
-import { MAX_OBJ_BYTES, validateObj, type ObjValidation } from "./obj.ts";
+import { MAX_OBJ_BYTES, objMaterialLibraries, rewriteObjMaterialLibraries, validateObj, type ObjValidation } from "./obj.ts";
 import { serializeHiddenLineSvg, type HiddenLineProjectionSegment } from "./hiddenline-svg.ts";
 import { tessellateCurve } from "./svg-tessellation.ts";
 import { analyzeSvgEllipseArc, fitSvgConicEllipse, fitSvgEllipse } from "./svg-ellipse.ts";
@@ -428,6 +428,55 @@ export interface ObjMeshOptions {
   density?: number;
   maxWidthMm?: number;
   curveChordMaxMm?: number;
+  /** Simplify Radial Surfaces. Default false. */
+  simplify?: boolean;
+  /** Separate edge chord tolerance in mm; defaults to the shared chordToleranceMm. */
+  curveChordToleranceMm?: number;
+  /** Separate face plane tolerance in mm; defaults to the shared chordToleranceMm. */
+  surfacePlaneToleranceMm?: number;
+  curveChordAngleDegrees?: number;
+  surfacePlaneAngleDegrees?: number;
+  planeAngleDegrees?: number;
+  /** Native lockPlaneTolerance / lockAngleTolerance switches. Value type unverified (assumed boolean). */
+  lockPlaneTolerance?: boolean;
+  lockAngleTolerance?: boolean;
+}
+
+export interface ObjExportOptions {
+  /** Write one OBJ per body into the directory given as the output path. */
+  perBody?: boolean;
+}
+
+export interface ObjFileResult extends ObjValidation {
+  path: string;
+  bytes: number;
+  /** MTL (or any sibling) handling: siblings written by the native export are copied next to the OBJ. */
+  mtl: { written: boolean; paths: string[]; mtllib: string[] };
+  siblingFiles: string[];
+}
+
+interface ObjExportCommon {
+  sourceUnits: "millimeter";
+  upAxis: "z";
+  chordToleranceMm: number;
+  angleToleranceDegrees: number;
+  meshOptions: ObjMeshOptions & { maxSides: number; simplify: boolean };
+}
+
+export type ObjExportResult = ObjFileResult & ObjExportCommon & { bodyId?: number; bodyName?: string | null };
+
+export interface ObjPerBodyExportResult extends ObjExportCommon {
+  perBody: true;
+  directory: string;
+  bodies: number;
+  files: ObjExportResult[];
+  mtlWritten: boolean;
+}
+
+/** `<sanitised body name>_<id>.obj`; the id keeps names unique and non-empty. */
+export function objBodyFileName(name: string | null, id: number): string {
+  const cleaned = (name ?? "").normalize("NFKD").replace(/[^A-Za-z0-9._-]+/gu, "_").replace(/^[._]+|[._]+$/gu, "").replace(/_{2,}/gu, "_").slice(0, 64);
+  return `${cleaned.length > 0 ? `${cleaned}_` : "body_"}${id}.obj`;
 }
 
 export class PlasticityOperations {
@@ -8675,6 +8724,9 @@ export class PlasticityOperations {
     }
   }
 
+  async exportObj(ids: number[], outputPath: string, revision: string, chordToleranceMm: number, angleToleranceDegrees: number, meshOptions?: ObjMeshOptions, exportOptions?: { perBody?: false }): Promise<ObjExportResult>;
+  async exportObj(ids: number[], outputPath: string, revision: string, chordToleranceMm: number, angleToleranceDegrees: number, meshOptions: ObjMeshOptions, exportOptions: { perBody: true }): Promise<ObjPerBodyExportResult>;
+  async exportObj(ids: number[], outputPath: string, revision: string, chordToleranceMm: number, angleToleranceDegrees: number, meshOptions?: ObjMeshOptions, exportOptions?: ObjExportOptions): Promise<ObjExportResult | ObjPerBodyExportResult>;
   async exportObj(
     ids: number[],
     outputPath: string,
@@ -8682,15 +8734,8 @@ export class PlasticityOperations {
     chordToleranceMm: number,
     angleToleranceDegrees: number,
     meshOptions: ObjMeshOptions = {},
-  ): Promise<ObjValidation & {
-    meshOptions: ObjMeshOptions & { maxSides: number };
-    path: string;
-    bytes: number;
-    sourceUnits: "millimeter";
-    upAxis: "z";
-    chordToleranceMm: number;
-    angleToleranceDegrees: number;
-  }> {
+    exportOptions: ObjExportOptions = {},
+  ): Promise<ObjExportResult | ObjPerBodyExportResult> {
     const state = await this.assertRevision(revision);
     requireMeshExportBodies(state, ids, "OBJ");
     if (!Number.isFinite(chordToleranceMm) || chordToleranceMm <= 0) throw new Error("OBJ chord tolerance must be a positive finite millimeter value");
@@ -8701,10 +8746,77 @@ export class PlasticityOperations {
     if (density !== undefined && (!Number.isFinite(density) || density < 0 || density > 1)) throw new Error("OBJ density must be a finite number within 0..1");
     if (maxWidthMm !== undefined && (!Number.isFinite(maxWidthMm) || maxWidthMm < 0)) throw new Error("OBJ maxWidthMm must be a finite millimeter value >= 0");
     if (curveChordMaxMm !== undefined && (!Number.isFinite(curveChordMaxMm) || curveChordMaxMm < 0)) throw new Error("OBJ curveChordMaxMm must be a finite millimeter value >= 0");
+    for (const key of ["curveChordToleranceMm", "surfacePlaneToleranceMm"] as const) {
+      const value = meshOptions[key];
+      if (value !== undefined && (!Number.isFinite(value) || value <= 0 || value > 10)) throw new Error(`OBJ ${key} must be a finite millimeter value within (0, 10]`);
+    }
+    for (const key of ["curveChordAngleDegrees", "surfacePlaneAngleDegrees", "planeAngleDegrees"] as const) {
+      const value = meshOptions[key];
+      if (value !== undefined && (!Number.isFinite(value) || value <= 0 || value > 90)) throw new Error(`OBJ ${key} must be within (0, 90] degrees`);
+    }
+    for (const key of ["simplify", "lockPlaneTolerance", "lockAngleTolerance"] as const) {
+      const value = meshOptions[key];
+      if (value !== undefined && typeof value !== "boolean") throw new Error(`OBJ ${key} must be a boolean`);
+    }
+    const perBody = exportOptions.perBody === true;
+    const nativeOptions = {
+      chordTolerance: millimetersToMeters(chordToleranceMm),
+      angleToleranceDegrees,
+      ...(maxSides !== undefined ? { maxSides } : {}),
+      ...(convex !== undefined ? { convex } : {}),
+      ...(density !== undefined ? { density } : {}),
+      ...(maxWidthMm !== undefined ? { maxWidth: millimetersToMeters(maxWidthMm) } : {}),
+      ...(curveChordMaxMm !== undefined ? { curveChordMax: millimetersToMeters(curveChordMaxMm) } : {}),
+      ...(meshOptions.simplify !== undefined ? { simplify: meshOptions.simplify } : {}),
+      ...(meshOptions.curveChordToleranceMm !== undefined ? { curveChordTolerance: millimetersToMeters(meshOptions.curveChordToleranceMm) } : {}),
+      ...(meshOptions.surfacePlaneToleranceMm !== undefined ? { surfacePlaneTolerance: millimetersToMeters(meshOptions.surfacePlaneToleranceMm) } : {}),
+      ...(meshOptions.curveChordAngleDegrees !== undefined ? { curveChordAngleDegrees: meshOptions.curveChordAngleDegrees } : {}),
+      ...(meshOptions.surfacePlaneAngleDegrees !== undefined ? { surfacePlaneAngleDegrees: meshOptions.surfacePlaneAngleDegrees } : {}),
+      ...(meshOptions.planeAngleDegrees !== undefined ? { planeAngleDegrees: meshOptions.planeAngleDegrees } : {}),
+      ...(meshOptions.lockPlaneTolerance !== undefined ? { lockPlaneTolerance: meshOptions.lockPlaneTolerance } : {}),
+      ...(meshOptions.lockAngleTolerance !== undefined ? { lockAngleTolerance: meshOptions.lockAngleTolerance } : {}),
+    };
+    const appliedMeshOptions: ObjMeshOptions & { maxSides: number; simplify: boolean } = {
+      maxSides: maxSides ?? 3,
+      simplify: meshOptions.simplify ?? false,
+      ...(convex !== undefined ? { convex } : {}),
+      ...(density !== undefined ? { density } : {}),
+      ...(maxWidthMm !== undefined ? { maxWidthMm } : {}),
+      ...(curveChordMaxMm !== undefined ? { curveChordMaxMm } : {}),
+      ...(meshOptions.curveChordToleranceMm !== undefined ? { curveChordToleranceMm: meshOptions.curveChordToleranceMm } : {}),
+      ...(meshOptions.surfacePlaneToleranceMm !== undefined ? { surfacePlaneToleranceMm: meshOptions.surfacePlaneToleranceMm } : {}),
+      ...(meshOptions.curveChordAngleDegrees !== undefined ? { curveChordAngleDegrees: meshOptions.curveChordAngleDegrees } : {}),
+      ...(meshOptions.surfacePlaneAngleDegrees !== undefined ? { surfacePlaneAngleDegrees: meshOptions.surfacePlaneAngleDegrees } : {}),
+      ...(meshOptions.planeAngleDegrees !== undefined ? { planeAngleDegrees: meshOptions.planeAngleDegrees } : {}),
+      ...(meshOptions.lockPlaneTolerance !== undefined ? { lockPlaneTolerance: meshOptions.lockPlaneTolerance } : {}),
+      ...(meshOptions.lockAngleTolerance !== undefined ? { lockAngleTolerance: meshOptions.lockAngleTolerance } : {}),
+    };
+    const common = { sourceUnits: "millimeter" as const, upAxis: "z" as const, chordToleranceMm, angleToleranceDegrees, meshOptions: appliedMeshOptions };
     const output = resolve(outputPath);
-    if (extname(output).toLowerCase() !== ".obj") throw new Error("OBJ output must end in .obj");
-    await assertAbsent(output);
-    await mkdir(dirname(output), { recursive: true });
+
+    if (!perBody) {
+      if (extname(output).toLowerCase() !== ".obj") throw new Error("OBJ output must end in .obj");
+      await assertAbsent(output);
+      await mkdir(dirname(output), { recursive: true });
+      const file = await this.exportObjFile(ids, output, nativeOptions);
+      return { ...file, ...common };
+    }
+
+    if (extname(output).toLowerCase() === ".obj") throw new Error("OBJ perBody output must be a directory path, not a .obj file");
+    const targets = ids.map((id) => ({ id, name: state.bodies.find((body) => body.id === id)?.name ?? null }))
+      .map((entry) => ({ ...entry, path: join(output, objBodyFileName(entry.name, entry.id)) }));
+    for (const target of targets) await assertAbsent(target.path);
+    await mkdir(output, { recursive: true });
+    const files: ObjExportResult[] = [];
+    for (const target of targets) {
+      const file = await this.exportObjFile([target.id], target.path, nativeOptions);
+      files.push({ ...file, ...common, bodyId: target.id, bodyName: target.name });
+    }
+    return { perBody: true, directory: output, bodies: files.length, files, mtlWritten: files.some((file) => file.mtl.written), ...common };
+  }
+
+  /** Exports one OBJ through a staging folder and publishes it, plus any sibling files such as a .mtl, next to `output`. */
+  private async exportObjFile(ids: number[], output: string, nativeOptions: Record<string, unknown>): Promise<ObjFileResult> {
     const staging = await mkdtemp(join(dirname(output), ".plasticity-obj-"));
     const temporary = join(staging, "geometry.obj");
     try {
@@ -8718,47 +8830,54 @@ export class PlasticityOperations {
         factory.scale = 1;
         factory.upAxis = 'z';
         factory.showWireframe = false;
-        factory.simplify = false;
-        factory.curveChordTolerance = args.chordTolerance;
-        factory.surfacePlaneTolerance = args.chordTolerance;
-        factory.curveChordAngleDegrees = args.angleToleranceDegrees;
-        factory.surfacePlaneAngleDegrees = args.angleToleranceDegrees;
+        factory.simplify = args.simplify ?? false;
+        if (args.lockPlaneTolerance !== undefined) factory.lockPlaneTolerance = args.lockPlaneTolerance;
+        if (args.lockAngleTolerance !== undefined) factory.lockAngleTolerance = args.lockAngleTolerance;
+        factory.curveChordTolerance = args.curveChordTolerance ?? args.chordTolerance;
+        factory.surfacePlaneTolerance = args.surfacePlaneTolerance ?? args.chordTolerance;
+        factory.curveChordAngleDegrees = args.curveChordAngleDegrees ?? args.angleToleranceDegrees;
+        factory.surfacePlaneAngleDegrees = args.surfacePlaneAngleDegrees ?? args.angleToleranceDegrees;
+        if (args.planeAngleDegrees !== undefined) factory.planeAngleDegrees = args.planeAngleDegrees;
         if (args.maxSides !== undefined) factory.maxSides = args.maxSides;
         if (args.convex !== undefined) factory.convex = args.convex;
         if (args.density !== undefined) factory.density = args.density;
         if (args.maxWidth !== undefined) factory.maxWidth = args.maxWidth;
         if (args.curveChordMax !== undefined) factory.curveChordMax = args.curveChordMax;
         await factory.commit();
-      }`, ["OBJExportFactory"], [{
-        ids,
-        path: temporary,
-        chordTolerance: millimetersToMeters(chordToleranceMm),
-        angleToleranceDegrees,
-        ...(maxSides !== undefined ? { maxSides } : {}),
-        ...(convex !== undefined ? { convex } : {}),
-        ...(density !== undefined ? { density } : {}),
-        ...(maxWidthMm !== undefined ? { maxWidth: millimetersToMeters(maxWidthMm) } : {}),
-        ...(curveChordMaxMm !== undefined ? { curveChordMax: millimetersToMeters(curveChordMaxMm) } : {}),
-      }]);
+      }`, ["OBJExportFactory"], [{ ids, path: temporary, ...nativeOptions }]);
       const temporarySize = (await stat(temporary)).size;
       if (temporarySize === 0 || temporarySize > MAX_OBJ_BYTES) throw new Error("Plasticity produced an empty or excessively large OBJ file");
-      const data = await readFile(temporary);
-      const validation = validateObj(data);
-      await copyFile(temporary, output, constants.COPYFILE_EXCL);
+      const original = await readFile(temporary);
+      const validation = validateObj(original);
+      const stem = basename(output, extname(output));
+      const siblings = (await readdir(staging)).filter((name) => name !== "geometry.obj").sort();
+      const renames = new Map<string, string>();
+      const siblingTargets = siblings.map((name) => {
+        const renamed = `${stem}${extname(name)}`;
+        renames.set(name, renamed);
+        return { from: join(staging, name), to: join(dirname(output), renamed) };
+      });
+      if (new Set(siblingTargets.map((target) => target.to)).size !== siblingTargets.length) throw new Error("Plasticity wrote several sibling files with the same extension; refusing to rename them onto one path");
+      for (const target of siblingTargets) await assertAbsent(target.to);
+      const data = rewriteObjMaterialLibraries(original, renames);
+      if (data === original) await copyFile(temporary, output, constants.COPYFILE_EXCL);
+      else await writeFile(output, data, { flag: "wx" });
+      for (const target of siblingTargets) await copyFile(target.from, target.to, constants.COPYFILE_EXCL);
+      const materialLibraries = objMaterialLibraries(data);
       return {
         path: output,
         bytes: data.length,
-        sourceUnits: "millimeter",
-        upAxis: "z",
         ...validation,
-        chordToleranceMm,
-        angleToleranceDegrees,
-        meshOptions: { maxSides: maxSides ?? 3, ...(convex !== undefined ? { convex } : {}), ...(density !== undefined ? { density } : {}), ...(maxWidthMm !== undefined ? { maxWidthMm } : {}), ...(curveChordMaxMm !== undefined ? { curveChordMaxMm } : {}) },
+        mtl: {
+          written: siblings.some((name) => extname(name).toLowerCase() === ".mtl"),
+          paths: siblingTargets.filter((target) => extname(target.to).toLowerCase() === ".mtl").map((target) => target.to),
+          mtllib: materialLibraries,
+        },
+        siblingFiles: siblingTargets.map((target) => target.to),
       };
     } finally {
       if (!this.runtime.isUncertain()) {
-        await rm(temporary, { force: true }).catch(() => undefined);
-        await rmdir(staging).catch(() => undefined);
+        await rm(staging, { recursive: true, force: true }).catch(() => undefined);
       }
     }
   }

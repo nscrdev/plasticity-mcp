@@ -1,10 +1,10 @@
 import assert from "node:assert/strict";
-import { mkdtemp, readFile, realpath, rm, truncate, writeFile } from "node:fs/promises";
+import { mkdtemp, readdir, readFile, realpath, rm, truncate, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 
-import { PlasticityOperations } from "./operations.ts";
+import { objBodyFileName, PlasticityOperations } from "./operations.ts";
 import { frameFromOriginNormalX } from "./construction.ts";
 import { evaluateSvgCubicBezier, type SvgCubicBezier } from "./svg-cubic.ts";
 import { countActiveCurveSpans } from "./curve-span-count.ts";
@@ -168,12 +168,138 @@ test("OBJ mesh options are validated and reach the factory only when given", asy
     assert.equal(args.density, 0.25);
     assert.equal(args.maxWidth, 0.002);
     assert.equal(args.curveChordMax, 0);
-    assert.deepEqual(result.meshOptions, { maxSides: 4, convex: true, density: 0.25, maxWidthMm: 2, curveChordMaxMm: 0 });
+    assert.deepEqual(result.meshOptions, { maxSides: 4, simplify: false, convex: true, density: 0.25, maxWidthMm: 2, curveChordMaxMm: 0 });
     assert.equal(result.quads, 1);
     assert.equal(result.triangleFaces, 0);
   } finally {
     await rm(root, { recursive: true, force: true });
   }
+});
+
+test("OBJ edge, face, plane and lock options map to the factory only when given", async () => {
+  const root = await mkdtemp(join(tmpdir(), "plasticity-obj-tol-"));
+  let values: unknown[] | undefined;
+  const body = { id: 7, versionId: 17, type: "Solid", name: "Box", boundsMm: null, faceIds: [], edgeIds: [], faces: [], edges: [], vertices: [] };
+  const state: RuntimeState = { targetId: "window-1", title: "Untitled - Plasticity", documentToken: "document-1", revision: "r", dbVersion: 1, undoDepth: 0, redoDepth: 0, construction: emptyConstruction, regions: [], bodies: [body] };
+  let mutations = 0;
+  let source = "";
+  const runtime = {
+    async getState() { return state; },
+    async mutate(src: string, _bindings: string[], args: unknown[]) {
+      mutations += 1; source = src; values = args;
+      await writeFile((args[0] as { path: string }).path, Buffer.from("o Q\nv 0 0 0\nv 1 0 0\nv 1 1 0\nf 1 2 3\n"));
+      return {};
+    },
+    isUncertain() { return false; },
+  } as unknown as PlasticityRuntime;
+  try {
+    const operations = new PlasticityOperations(runtime);
+    for (const [options, pattern] of [
+      [{ curveChordToleranceMm: 0 }, /curveChordToleranceMm/u], [{ surfacePlaneToleranceMm: 11 }, /surfacePlaneToleranceMm/u],
+      [{ curveChordAngleDegrees: 0 }, /curveChordAngleDegrees/u], [{ surfacePlaneAngleDegrees: 91 }, /surfacePlaneAngleDegrees/u],
+      [{ planeAngleDegrees: Number.NaN }, /planeAngleDegrees/u], [{ simplify: "yes" as unknown as boolean }, /simplify/u],
+      [{ lockPlaneTolerance: 1 as unknown as boolean }, /lockPlaneTolerance/u], [{ lockAngleTolerance: "x" as unknown as boolean }, /lockAngleTolerance/u],
+    ] as const) {
+      await assert.rejects(operations.exportObj([7], join(root, "bad.obj"), "r", 0.05, 15, options), pattern);
+    }
+    assert.equal(mutations, 0);
+
+    await operations.exportObj([7], join(root, "default.obj"), "r", 0.05, 15);
+    assert.deepEqual(Object.keys(values?.[0] as object).sort(), ["angleToleranceDegrees", "chordTolerance", "ids", "path"]);
+    assert.match(source, /factory\.simplify = args\.simplify \?\? false/u);
+
+    const result = await operations.exportObj([7], join(root, "tol.obj"), "r", 0.05, 15, {
+      simplify: true, curveChordToleranceMm: 0.01, surfacePlaneToleranceMm: 0.2, curveChordAngleDegrees: 5, surfacePlaneAngleDegrees: 20,
+      planeAngleDegrees: 3, lockPlaneTolerance: true, lockAngleTolerance: false,
+    });
+    const args = values?.[0] as Record<string, unknown>;
+    assert.equal(args.simplify, true);
+    assert.equal(args.curveChordTolerance, 0.00001);
+    assert.equal(args.surfacePlaneTolerance, 0.0002);
+    assert.equal(args.chordTolerance, 0.00005);
+    assert.equal(args.curveChordAngleDegrees, 5);
+    assert.equal(args.surfacePlaneAngleDegrees, 20);
+    assert.equal(args.angleToleranceDegrees, 15);
+    assert.equal(args.planeAngleDegrees, 3);
+    assert.equal(args.lockPlaneTolerance, true);
+    assert.equal(args.lockAngleTolerance, false);
+    assert.deepEqual(result.meshOptions, {
+      maxSides: 3, simplify: true, curveChordToleranceMm: 0.01, surfacePlaneToleranceMm: 0.2, curveChordAngleDegrees: 5,
+      surfacePlaneAngleDegrees: 20, planeAngleDegrees: 3, lockPlaneTolerance: true, lockAngleTolerance: false,
+    });
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("copies a sibling MTL next to the OBJ and rewrites mtllib", async () => {
+  const root = await mkdtemp(join(tmpdir(), "plasticity-obj-mtl-"));
+  const body = { id: 7, versionId: 17, type: "Solid", name: "Box", boundsMm: null, faceIds: [], edgeIds: [], faces: [], edges: [], vertices: [] };
+  const state: RuntimeState = { targetId: "window-1", title: "Untitled - Plasticity", documentToken: "document-1", revision: "r", dbVersion: 1, undoDepth: 0, redoDepth: 0, construction: emptyConstruction, regions: [], bodies: [body] };
+  const runtime = {
+    async getState() { return state; },
+    async mutate(_src: string, _bindings: string[], args: unknown[]) {
+      const path = (args[0] as { path: string }).path;
+      await writeFile(path, Buffer.from("mtllib geometry.mtl\no Q\nusemtl m1\nv 0 0 0\nv 1 0 0\nv 1 1 0\nf 1 2 3\n"));
+      await writeFile(path.replace(/\.obj$/u, ".mtl"), "newmtl m1\nKd 1 0 0\n");
+      return {};
+    },
+    isUncertain() { return false; },
+  } as unknown as PlasticityRuntime;
+  try {
+    const operations = new PlasticityOperations(runtime);
+    const output = join(root, "stick.obj");
+    const result = await operations.exportObj([7], output, "r", 0.05, 15);
+    assert.match(await readFile(output, "utf8"), /^mtllib stick\.mtl\n/u);
+    assert.equal(await readFile(join(root, "stick.mtl"), "utf8"), "newmtl m1\nKd 1 0 0\n");
+    assert.deepEqual(result.mtl, { written: true, paths: [join(root, "stick.mtl")], mtllib: ["stick.mtl"] });
+    assert.deepEqual(result.siblingFiles, [join(root, "stick.mtl")]);
+    assert.deepEqual((await readdir(root)).sort(), ["stick.mtl", "stick.obj"]);
+    await assert.rejects(operations.exportObj([7], join(root, "other.obj"), "r", 0.05, 15).then(() => operations.exportObj([7], join(root, "other.obj"), "r", 0.05, 15)), /overwrite/u);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("perBody OBJ export writes one sanitised, id-suffixed file per body", async () => {
+  const root = await mkdtemp(join(tmpdir(), "plasticity-obj-perbody-"));
+  const make = (id: number, name: string | null) => ({ id, versionId: id + 10, type: "Solid", name, boundsMm: null, faceIds: [], edgeIds: [], faces: [], edges: [], vertices: [] });
+  const state: RuntimeState = { targetId: "window-1", title: "Untitled - Plasticity", documentToken: "document-1", revision: "r", dbVersion: 1, undoDepth: 0, redoDepth: 0, construction: emptyConstruction, regions: [], bodies: [make(7, "Stick Cap/L1"), make(8, null), make(9, "Stick Cap/L1")] };
+  const calls: number[][] = [];
+  const runtime = {
+    async getState() { return state; },
+    async mutate(_src: string, _bindings: string[], args: unknown[]) {
+      const { ids, path } = args[0] as { ids: number[]; path: string };
+      calls.push(ids);
+      await writeFile(path, Buffer.from("o Q\nv 0 0 0\nv 1 0 0\nv 1 1 0\nf 1 2 3\n"));
+      return {};
+    },
+    isUncertain() { return false; },
+  } as unknown as PlasticityRuntime;
+  try {
+    const operations = new PlasticityOperations(runtime);
+    await assert.rejects(operations.exportObj([7], join(root, "x.obj"), "r", 0.05, 15, {}, { perBody: true }), /directory/u);
+    const directory = join(root, "parts");
+    const result = await operations.exportObj([7, 8, 9], directory, "r", 0.05, 15, {}, { perBody: true });
+    assert.deepEqual(calls, [[7], [8], [9]]);
+    assert.deepEqual((await readdir(directory)).sort(), ["Stick_Cap_L1_7.obj", "Stick_Cap_L1_9.obj", "body_8.obj"]);
+    assert.equal(result.perBody, true);
+    assert.equal(result.bodies, 3);
+    assert.equal(result.mtlWritten, false);
+    assert.deepEqual(result.files.map((file) => [file.bodyId, file.bodyName, file.faces]), [[7, "Stick Cap/L1", 1], [8, null, 1], [9, "Stick Cap/L1", 1]]);
+    await assert.rejects(operations.exportObj([7], directory, "r", 0.05, 15, {}, { perBody: true }), /overwrite/u);
+    assert.equal(calls.length, 3);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("objBodyFileName sanitises names and always carries the id", () => {
+  assert.equal(objBodyFileName("Left Grip (v2)", 12), "Left_Grip_v2_12.obj");
+  assert.equal(objBodyFileName("../../etc", 3), "etc_3.obj");
+  assert.equal(objBodyFileName("", 4), "body_4.obj");
+  assert.equal(objBodyFileName("名前", 5), "body_5.obj");
+  assert.ok(objBodyFileName("x".repeat(200), 1).length <= 70);
 });
 
 test("exports selected native bodies as a validated millimeter OBJ mesh", async () => {
@@ -209,6 +335,8 @@ test("exports selected native bodies as a validated millimeter OBJ mesh", async 
     assert.deepEqual(result, {
       path: output,
       bytes: payload.length,
+      mtl: { written: false, paths: [], mtllib: [] },
+      siblingFiles: [],
       sourceUnits: "millimeter",
       upAxis: "z",
       objects: 1,
@@ -224,7 +352,7 @@ test("exports selected native bodies as a validated millimeter OBJ mesh", async 
       boundsMm: { min: [0, 0, 0], max: [20, 10, 5], size: [20, 10, 5] },
       chordToleranceMm: 0.08,
       angleToleranceDegrees: 12,
-      meshOptions: { maxSides: 3 },
+      meshOptions: { maxSides: 3, simplify: false },
     });
     assert.deepEqual(await readFile(output), payload);
     await assert.rejects(operations.exportObj([7], output, state.revision, 0.08, 12), /overwrite/u);

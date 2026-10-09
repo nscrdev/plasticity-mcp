@@ -1555,12 +1555,12 @@ test("MCP validates and forwards native OBJ export parameters", async () => {
       ids: [7], path: "/tmp/part.obj", chordToleranceMm: 0.08, angleToleranceDegrees: 12, revision: "r1",
     } });
     assert.equal(response.isError, undefined);
-    assert.deepEqual(received, [[7], "/tmp/part.obj", "r1", 0.08, 12, {}]);
+    assert.deepEqual(received, [[7], "/tmp/part.obj", "r1", 0.08, 12, {}, { perBody: false }]);
     const quad = await client.callTool({ name: "plasticity_export_obj", arguments: {
       ids: [7], path: "/tmp/part.obj", maxSides: 4, convex: false, density: 0.5, maxWidthMm: 0, curveChordMaxMm: 0.1, revision: "r1",
     } });
     assert.equal(quad.isError, undefined);
-    assert.deepEqual(received, [[7], "/tmp/part.obj", "r1", 0.05, 15, { maxSides: 4, convex: false, density: 0.5, maxWidthMm: 0, curveChordMaxMm: 0.1 }]);
+    assert.deepEqual(received, [[7], "/tmp/part.obj", "r1", 0.05, 15, { maxSides: 4, convex: false, density: 0.5, maxWidthMm: 0, curveChordMaxMm: 0.1 }, { perBody: false }]);
     for (const bad of [{ maxSides: 2 }, { maxSides: 65 }, { maxSides: 4.5 }, { density: 2 }, { maxWidthMm: -1 }, { curveChordMaxMm: -0.1 }, { convex: "yes" }]) {
       const rejected = await client.callTool({ name: "plasticity_export_obj", arguments: { ids: [7], path: "/tmp/part.obj", revision: "r1", ...bad } });
       assert.equal(rejected.isError, true, JSON.stringify(bad));
@@ -1569,6 +1569,39 @@ test("MCP validates and forwards native OBJ export parameters", async () => {
       ids: [7], path: "/tmp/part.obj", chordToleranceMm: 0, angleToleranceDegrees: 12, revision: "r1",
     } });
     assert.equal(invalid.isError, true);
+  } finally {
+    await client.close(); await server.close();
+  }
+});
+
+test("MCP forwards extended OBJ options and perBody", async () => {
+  const received: Record<string, unknown[]> = {};
+  const operations = {
+    async exportObj(...args: unknown[]) { received.obj = args; return { path: "/tmp/p", perBody: true }; },
+  } as unknown as PlasticityOperations;
+  const fake = {
+    async windows() { return []; }, async connect() { return {}; }, get() { return operations; },
+    capabilities() { return { bindings: [], operations: unavailableConstruction() }; },
+    async captureSnapshot() { return {}; }, async changesSince() { return {}; }, async waitForChange() { return {}; },
+  } satisfies SessionLike;
+  const server = createServer(fake);
+  const client = new Client({ name: "obj-ext-test-client", version: "1.0.0" });
+  const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+  await server.connect(serverTransport); await client.connect(clientTransport);
+  try {
+    const ok = await client.callTool({ name: "plasticity_export_obj", arguments: {
+      ids: [7, 8], path: "/tmp/parts", perBody: true, simplify: true, curveChordToleranceMm: 0.01, surfacePlaneToleranceMm: 0.2,
+      curveChordAngleDegrees: 5, surfacePlaneAngleDegrees: 20, planeAngleDegrees: 3, lockPlaneTolerance: true, lockAngleTolerance: false, revision: "r1",
+    } });
+    assert.equal(ok.isError, undefined);
+    assert.deepEqual(received.obj, [[7, 8], "/tmp/parts", "r1", 0.05, 15, {
+      curveChordToleranceMm: 0.01, surfacePlaneToleranceMm: 0.2, curveChordAngleDegrees: 5, surfacePlaneAngleDegrees: 20,
+      planeAngleDegrees: 3, lockPlaneTolerance: true, lockAngleTolerance: false, simplify: true,
+    }, { perBody: true }]);
+    for (const bad of [{ curveChordToleranceMm: 0 }, { surfacePlaneToleranceMm: 11 }, { curveChordAngleDegrees: 91 }, { surfacePlaneAngleDegrees: 0 }, { planeAngleDegrees: -1 }, { simplify: "y" }, { lockPlaneTolerance: 1 }, { perBody: "yes" }]) {
+      const rejected = await client.callTool({ name: "plasticity_export_obj", arguments: { ids: [7], path: "/tmp/p.obj", revision: "r1", ...bad } });
+      assert.equal(rejected.isError, true, JSON.stringify(bad));
+    }
   } finally {
     await client.close(); await server.close();
   }

@@ -442,6 +442,23 @@ export interface ObjMeshOptions {
   lockAngleTolerance?: boolean;
 }
 
+export interface ChamferOptions {
+  /** Second distance for a two-distance chamfer, in mm. */
+  distance2Mm?: number;
+  /** Native ChamferMode: Offset (default) or Apex. */
+  mode?: "offset" | "apex";
+}
+
+export interface VariableFilletPoint {
+  edgeId: string;
+  /** Radius at this point, in mm. */
+  radiusMm: number;
+  /** Position along the edge, 0..1 (exclusive of pointMm). */
+  t?: number | undefined;
+  /** Explicit world point in mm (exclusive of t). */
+  pointMm?: [number, number, number] | undefined;
+}
+
 export interface ObjExportOptions {
   /** Write one OBJ per body into the directory given as the output path. */
   perBody?: boolean;
@@ -4827,9 +4844,20 @@ export class PlasticityOperations {
     return await this.state();
   }
 
-  async chamfer(id: number, edgeIds: string[], distanceMm: number, revision: string): Promise<RuntimeState> {
+  /**
+   * Equal-distance chamfer by default. `distance2Mm` switches to a two-distance chamfer
+   * (lockDistances = false, distance1/distance2); `mode: "apex"` sets ChamferMode.Apex.
+   * Field names come from the live 26.1.3 prototype; the sign convention of distance1/distance2
+   * (negative, like `distance`) and the Apex semantics are unverified until a live run.
+   */
+  async chamfer(id: number, edgeIds: string[], distanceMm: number, revision: string, options: ChamferOptions = {}): Promise<RuntimeState> {
     await this.assertRevision(revision);
-    await this.runtime.mutate(`async function (Factory, args) {
+    const { distance2Mm, mode } = options;
+    if (distance2Mm !== undefined && (!Number.isFinite(distance2Mm) || distance2Mm <= 0)) throw new Error("Chamfer distance2Mm must be a positive finite millimeter value");
+    if (mode !== undefined && mode !== "offset" && mode !== "apex") throw new Error("Chamfer mode must be offset or apex");
+    if (distance2Mm !== undefined && mode === "apex") throw new Error("Chamfer distance2Mm cannot be combined with apex mode");
+    if (distance2Mm === undefined && mode === undefined) {
+      await this.runtime.mutate(`async function (Factory, args) {
       ${findView}
       ${commandStart("FilletShellCommand")}
       const view = find(args.id);
@@ -4843,6 +4871,96 @@ export class PlasticityOperations {
       factory.distance = args.distance;
       ${commandEnd}
     }`, ["FilletShellFactory"], [{ id, edgeIds, distance: -millimetersToMeters(distanceMm) }]);
+      return await this.state();
+    }
+    await this.runtime.mutate(`async function (Factory, ChamferMode, args) {
+      ${findView}
+      ${commandStart("FilletShellCommand")}
+      const view = find(args.id);
+      const edges = view.high.edges;
+      factory.shell = view;
+      factory.edges = args.edgeIds.map(id => {
+        const index = edges.versionIds.indexOf(id);
+        if (index < 0) throw new Error('Stale or unknown edge: ' + id);
+        return edges.get(index);
+      });
+      factory.distance = args.distance;
+      if (args.distance2 !== undefined) {
+        factory.lockDistances = false;
+        factory.distance1 = args.distance;
+        factory.distance2 = args.distance2;
+      }
+      if (args.mode !== undefined) factory.chamferMode = args.mode === 'apex' ? ChamferMode.Apex : ChamferMode.Offset;
+      ${commandEnd}
+    }`, ["FilletShellFactory", "ChamferMode"], [{
+      id,
+      edgeIds,
+      distance: -millimetersToMeters(distanceMm),
+      ...(distance2Mm !== undefined ? { distance2: -millimetersToMeters(distance2Mm) } : {}),
+      ...(mode !== undefined ? { mode } : {}),
+    }]);
+    return await this.state();
+  }
+
+  /**
+   * Variable-radius fillet. UNVERIFIED against the live app: `addVariationPoint` has declared arity 2 and the
+   * argument order (point, radius) in metres is inferred, not read. The script refuses to run when the arity differs.
+   * Each point is placed on a native edge at `t` (0..1 along the edge, GetPointAndTangent) or at an explicit point.
+   */
+  async filletVariable(id: number, edgeIds: string[], radiusMm: number, points: VariableFilletPoint[], revision: string): Promise<RuntimeState> {
+    await this.assertRevision(revision);
+    if (!Number.isFinite(radiusMm) || radiusMm <= 0) throw new Error("Variable fillet base radiusMm must be a positive finite millimeter value");
+    if (points.length === 0) throw new Error("Variable fillet needs at least one variation point");
+    const mapped = points.map((point) => {
+      if (!edgeIds.includes(point.edgeId)) throw new Error(`Variation point edge ${point.edgeId} is not in edgeIds`);
+      if (!Number.isFinite(point.radiusMm) || point.radiusMm <= 0) throw new Error("Variation point radiusMm must be a positive finite millimeter value");
+      const hasT = point.t !== undefined;
+      const hasPoint = point.pointMm !== undefined;
+      if (hasT === hasPoint) throw new Error("Each variation point needs exactly one of t or pointMm");
+      if (hasT && (!Number.isFinite(point.t!) || point.t! < 0 || point.t! > 1)) throw new Error("Variation point t must be within 0..1");
+      if (hasPoint && (point.pointMm!.length !== 3 || !point.pointMm!.every(Number.isFinite))) throw new Error("Variation point pointMm must be three finite millimeter values");
+      return {
+        edgeId: point.edgeId,
+        radius: millimetersToMeters(point.radiusMm),
+        ...(hasT ? { t: point.t } : { point: point.pointMm!.map(millimetersToMeters) }),
+      };
+    });
+    await this.runtime.mutate(`async function (Factory, args) {
+      ${findView}
+      ${commandStart("FilletShellCommand")}
+      const view = find(args.id);
+      let item;
+      for (const [versionId, candidate] of editor.geo.geometryModel) {
+        if (editor.db.lookupStableId(versionId) === args.id) { item = candidate; break; }
+      }
+      const edges = view.high.edges;
+      const modelEdges = item.model?.GetEdges?.();
+      const resolveEdge = edgeId => {
+        const index = edges.versionIds.indexOf(edgeId);
+        if (index < 0) throw new Error('Stale or unknown edge: ' + edgeId);
+        return edges.get(index);
+      };
+      const nativeEdge = edgeView => {
+        for (let index = 0; index < (modelEdges?.Size?.() ?? 0); index++) {
+          const candidate = modelEdges.Get(index);
+          if (candidate.Id() === edgeView.entityId) return candidate;
+        }
+        throw new Error('Native B-Rep edge entity is unavailable');
+      };
+      if (typeof factory.addVariationPoint !== 'function' || factory.addVariationPoint.length !== 2) {
+        throw new Error('FilletShellFactory.addVariationPoint does not have the expected two-argument signature; refusing to guess');
+      }
+      factory.shell = view;
+      factory.edges = args.edgeIds.map(resolveEdge);
+      factory.distance = args.distance;
+      for (const entry of args.points) {
+        const point = entry.point
+          ? { x: entry.point[0], y: entry.point[1], z: entry.point[2] }
+          : nativeEdge(resolveEdge(entry.edgeId)).GetPointAndTangent(entry.t).position;
+        factory.addVariationPoint(point, entry.radius);
+      }
+      ${commandEnd}
+    }`, ["FilletShellFactory"], [{ id, edgeIds, distance: millimetersToMeters(radiusMm), points: mapped }]);
     return await this.state();
   }
 

@@ -1574,10 +1574,14 @@ test("MCP validates and forwards native OBJ export parameters", async () => {
   }
 });
 
-test("MCP forwards extended OBJ options and perBody", async () => {
+test("MCP forwards extended OBJ options and perBody, and chamfer/variable fillet inputs", async () => {
   const received: Record<string, unknown[]> = {};
+  const state = { targetId: "w", title: "t", documentToken: "d", revision: "r1", dbVersion: 1, undoDepth: 0, redoDepth: 0, regions: [], bodies: [], construction: { planes: [], activePlaneId: "standard:top", planeStateToken: "p", viewStateToken: "v" } };
   const operations = {
     async exportObj(...args: unknown[]) { received.obj = args; return { path: "/tmp/p", perBody: true }; },
+    async chamfer(...args: unknown[]) { received.chamfer = args; return state; },
+    async filletVariable(...args: unknown[]) { received.variable = args; return state; },
+    async state() { return state; },
   } as unknown as PlasticityOperations;
   const fake = {
     async windows() { return []; }, async connect() { return {}; }, get() { return operations; },
@@ -1600,6 +1604,25 @@ test("MCP forwards extended OBJ options and perBody", async () => {
     }, { perBody: true }]);
     for (const bad of [{ curveChordToleranceMm: 0 }, { surfacePlaneToleranceMm: 11 }, { curveChordAngleDegrees: 91 }, { surfacePlaneAngleDegrees: 0 }, { planeAngleDegrees: -1 }, { simplify: "y" }, { lockPlaneTolerance: 1 }, { perBody: "yes" }]) {
       const rejected = await client.callTool({ name: "plasticity_export_obj", arguments: { ids: [7], path: "/tmp/p.obj", revision: "r1", ...bad } });
+      assert.equal(rejected.isError, true, JSON.stringify(bad));
+    }
+
+    const chamfer = await client.callTool({ name: "plasticity_chamfer", arguments: { id: 7, edgeIds: ["e1"], distanceMm: 2, distance2Mm: 4, revision: "r1" } });
+    assert.equal(chamfer.isError, undefined, JSON.stringify(chamfer));
+    assert.deepEqual(received.chamfer, [7, ["e1"], 2, "r1", { distance2Mm: 4 }]);
+    await client.callTool({ name: "plasticity_chamfer", arguments: { id: 7, edgeIds: ["e1"], distanceMm: 2, revision: "r1" } });
+    assert.deepEqual(received.chamfer, [7, ["e1"], 2, "r1", {}]);
+    for (const bad of [{ distance2Mm: 0 }, { mode: "bevel" }, { distance2Mm: 1, mode: "apex" }]) {
+      const rejected = await client.callTool({ name: "plasticity_chamfer", arguments: { id: 7, edgeIds: ["e1"], distanceMm: 2, revision: "r1", ...bad } });
+      assert.equal(rejected.isError, true, JSON.stringify(bad));
+    }
+
+    const points = [{ edgeId: "e1", t: 0.5, radiusMm: 3 }, { edgeId: "e1", pointMm: [1, 2, 3], radiusMm: 2 }];
+    const variable = await client.callTool({ name: "plasticity_fillet_variable", arguments: { id: 7, edgeIds: ["e1"], radiusMm: 1, points, revision: "r1" } });
+    assert.equal(variable.isError, undefined);
+    assert.deepEqual(received.variable, [7, ["e1"], 1, points, "r1"]);
+    for (const bad of [[], [{ edgeId: "e1", radiusMm: 3 }], [{ edgeId: "e1", t: 1.2, radiusMm: 3 }], [{ edgeId: "e1", t: 0.5, pointMm: [0, 0, 0], radiusMm: 3 }], [{ edgeId: "e1", t: 0.5, radiusMm: 0 }]]) {
+      const rejected = await client.callTool({ name: "plasticity_fillet_variable", arguments: { id: 7, edgeIds: ["e1"], radiusMm: 1, points: bad, revision: "r1" } });
       assert.equal(rejected.isError, true, JSON.stringify(bad));
     }
   } finally {

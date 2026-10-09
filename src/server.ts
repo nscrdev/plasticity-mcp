@@ -3153,8 +3153,24 @@ function createServerWithCatalog(
   });
   tool("plasticity_fillet", "Fillet current edge IDs with a radius in millimeters.", z.object({ id: z.number().int().positive(), edgeIds: z.array(z.string()).min(1), radiusMm: z.number().finite().positive(), intent, revision }), async ({ id, edgeIds, radiusMm, intent: purpose, revision: current }) =>
     await journaled("fillet", purpose, { id, edgeIds, radiusMm }, () => session.get().fillet(id, edgeIds, radiusMm, current)));
-  tool("plasticity_chamfer", "Chamfer current edge IDs by an equal distance in millimeters.", z.object({ id: z.number().int().positive(), edgeIds: z.array(z.string()).min(1), distanceMm: z.number().finite().positive(), intent, revision }), async ({ id, edgeIds, distanceMm, intent: purpose, revision: current }) =>
-    await journaled("chamfer", purpose, { id, edgeIds, distanceMm }, () => session.get().chamfer(id, edgeIds, distanceMm, current)));
+  tool("plasticity_chamfer", "Chamfer current edge IDs by an equal distance in millimeters. Optional distance2Mm makes a two-distance chamfer (distanceMm is distance 1); mode \"apex\" selects the native Apex chamfer mode (default \"offset\"). The two options cannot be combined. The sign convention of the second distance and the Apex semantics come from native field names only and need a live check.", z.object({ id: z.number().int().positive(), edgeIds: z.array(z.string()).min(1), distanceMm: z.number().finite().positive(), distance2Mm: z.number().finite().positive().optional(), mode: z.enum(["offset", "apex"]).optional(), intent, revision }).strict().refine((value) => !(value.distance2Mm !== undefined && value.mode === "apex"), "distance2Mm cannot be combined with mode apex"), async ({ id, edgeIds, distanceMm, distance2Mm, mode, intent: purpose, revision: current }) => {
+    const options = { ...(distance2Mm !== undefined ? { distance2Mm } : {}), ...(mode !== undefined ? { mode } : {}) };
+    return await journaled("chamfer", purpose, { id, edgeIds, distanceMm, ...options }, () => session.get().chamfer(id, edgeIds, distanceMm, current, options));
+  });
+  tool("plasticity_fillet_variable", "EXPERIMENTAL variable-radius fillet of current edge IDs. radiusMm is the base radius; each entry in points sets the radius at one position on one of those edges, either t (0..1 along the edge) or pointMm (world point in millimeters), plus radiusMm. Implemented as a separate tool because it needs a point list that does not fit plasticity_fillet's constant radius. The native FilletShellFactory.addVariationPoint argument order is inferred (declared arity 2) and the call is refused if the arity differs; verify on a scratch body before relying on it.", z.object({
+    id: z.number().int().positive(),
+    edgeIds: z.array(z.string()).min(1),
+    radiusMm: z.number().finite().positive(),
+    points: z.array(z.object({
+      edgeId: z.string(),
+      radiusMm: z.number().finite().positive(),
+      t: z.number().finite().min(0).max(1).optional(),
+      pointMm: z.tuple([z.number().finite(), z.number().finite(), z.number().finite()]).optional(),
+    }).strict().refine((point) => (point.t === undefined) !== (point.pointMm === undefined), "Provide exactly one of t or pointMm")).min(1).max(256),
+    intent,
+    revision,
+  }).strict(), async ({ id, edgeIds, radiusMm, points, intent: purpose, revision: current }) =>
+    await journaled("fillet-variable", purpose, { id, edgeIds, radiusMm, points }, () => session.get().filletVariable(id, edgeIds, radiusMm, points, current)));
   tool("plasticity_remove_fillets", "Remove every native fillet recognized on one or more current Solid or Sheet bodies.", z.object({ ids, intent, revision }).strict(), async ({ ids: bodyIds, intent: purpose, revision: current }) =>
     await journaled("remove-fillets", purpose, { ids: bodyIds }, () => session.get().removeFillets(bodyIds, current)));
   tool("plasticity_refillet_faces", "Change recognized native fillet faces by a signed radius delta in millimeters.", z.object({ faces: z.array(faceRef).min(1).max(4096), deltaMm: nonzeroDistance, intent, revision }).strict(), async ({ faces, deltaMm, intent: purpose, revision: current }) =>

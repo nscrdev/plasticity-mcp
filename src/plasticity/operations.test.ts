@@ -2938,6 +2938,65 @@ test("converts a positive chamfer distance to the native negative fillet distanc
   assert.deepEqual(values, [{ id: 7, edgeIds: ["edge-1"], distance: -0.002 }]);
 });
 
+test("chamfer sets two-distance and apex fields only when asked", async () => {
+  let call: { source: string; bindings: string[]; values: unknown[] } | undefined;
+  const state: RuntimeState = { targetId: "window-1", title: "Untitled - Plasticity", documentToken: "document-1", revision: "current-revision", dbVersion: 1, undoDepth: 0, redoDepth: 0, regions: [], construction: emptyConstruction, bodies: [] };
+  const runtime = { async getState() { return state; }, async mutate(source: string, bindings: string[], values: unknown[]) { call = { source, bindings, values }; return {}; } } as unknown as PlasticityRuntime;
+  const operations = new PlasticityOperations(runtime);
+
+  await operations.chamfer(7, ["e1"], 2, state.revision);
+  assert.deepEqual(call?.bindings, ["FilletShellFactory"]);
+  assert.doesNotMatch(call?.source ?? "", /distance1|chamferMode/u);
+
+  await operations.chamfer(7, ["e1"], 2, state.revision, { distance2Mm: 5 });
+  assert.deepEqual(call?.bindings, ["FilletShellFactory", "ChamferMode"]);
+  assert.deepEqual(call?.values, [{ id: 7, edgeIds: ["e1"], distance: -0.002, distance2: -0.005 }]);
+  assert.match(call?.source ?? "", /factory\.lockDistances = false/u);
+  assert.match(call?.source ?? "", /factory\.distance1 = args\.distance/u);
+  assert.match(call?.source ?? "", /factory\.distance2 = args\.distance2/u);
+
+  await operations.chamfer(7, ["e1"], 2, state.revision, { mode: "apex" });
+  assert.deepEqual(call?.values, [{ id: 7, edgeIds: ["e1"], distance: -0.002, mode: "apex" }]);
+  assert.match(call?.source ?? "", /ChamferMode\.Apex/u);
+
+  call = undefined;
+  await assert.rejects(operations.chamfer(7, ["e1"], 2, state.revision, { distance2Mm: 0 }), /distance2Mm/u);
+  await assert.rejects(operations.chamfer(7, ["e1"], 2, state.revision, { distance2Mm: 3, mode: "apex" }), /cannot be combined/u);
+  await assert.rejects(operations.chamfer(7, ["e1"], 2, state.revision, { mode: "bevel" as "apex" }), /offset or apex/u);
+  assert.equal(call, undefined);
+});
+
+test("variable fillet maps t and explicit points to metre radii and validates input", async () => {
+  let call: { source: string; bindings: string[]; values: unknown[] } | undefined;
+  const state: RuntimeState = { targetId: "window-1", title: "Untitled - Plasticity", documentToken: "document-1", revision: "current-revision", dbVersion: 1, undoDepth: 0, redoDepth: 0, regions: [], construction: emptyConstruction, bodies: [] };
+  const runtime = { async getState() { return state; }, async mutate(source: string, bindings: string[], values: unknown[]) { call = { source, bindings, values }; return {}; } } as unknown as PlasticityRuntime;
+  const operations = new PlasticityOperations(runtime);
+
+  await operations.filletVariable(7, ["e1", "e2"], 1, [
+    { edgeId: "e1", t: 0.25, radiusMm: 2 },
+    { edgeId: "e2", pointMm: [10, 20, 30], radiusMm: 3.5 },
+  ], state.revision);
+  assert.deepEqual(call?.bindings, ["FilletShellFactory"]);
+  assert.deepEqual(call?.values, [{
+    id: 7, edgeIds: ["e1", "e2"], distance: 0.001,
+    points: [{ edgeId: "e1", radius: 0.002, t: 0.25 }, { edgeId: "e2", radius: 0.0035, point: [0.01, 0.02, 0.03] }],
+  }]);
+  assert.match(call?.source ?? "", /addVariationPoint\.length !== 2/u);
+  assert.match(call?.source ?? "", /GetPointAndTangent\(entry\.t\)\.position/u);
+
+  call = undefined;
+  const p = { edgeId: "e1", radiusMm: 2, t: 0.5 };
+  await assert.rejects(operations.filletVariable(7, ["e1"], 0, [p], state.revision), /base radius/u);
+  await assert.rejects(operations.filletVariable(7, ["e1"], 1, [], state.revision), /at least one/u);
+  await assert.rejects(operations.filletVariable(7, ["e1"], 1, [{ ...p, edgeId: "e9" }], state.revision), /not in edgeIds/u);
+  await assert.rejects(operations.filletVariable(7, ["e1"], 1, [{ ...p, radiusMm: 0 }], state.revision), /radiusMm/u);
+  await assert.rejects(operations.filletVariable(7, ["e1"], 1, [{ ...p, t: 1.5 }], state.revision), /0\.\.1/u);
+  await assert.rejects(operations.filletVariable(7, ["e1"], 1, [{ edgeId: "e1", radiusMm: 2 }], state.revision), /exactly one/u);
+  await assert.rejects(operations.filletVariable(7, ["e1"], 1, [{ ...p, pointMm: [0, 0, 0] }], state.revision), /exactly one/u);
+  await assert.rejects(operations.filletVariable(7, ["e1"], 1, [{ edgeId: "e1", radiusMm: 2, pointMm: [0, 0] as unknown as [number, number, number] }], state.revision), /three finite/u);
+  assert.equal(call, undefined);
+});
+
 test("removes recognized native fillets from current shell bodies", async () => {
   let call: { source: string; bindings: string[]; values: unknown[] } | undefined;
   const solid = { id: 7, versionId: 17, type: "Solid", name: null, boundsMm: null, faceIds: ["f1"], edgeIds: [], faces: [], edges: [] };

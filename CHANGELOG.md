@@ -9,6 +9,11 @@
 - `validateObj` reports `perObject` counts and bounds when a file has several `o` groups.
 - `plasticity_chamfer` now rejects unknown keys (it is `.strict()`; extra keys used to be dropped silently). The equal-distance path is unchanged. `distance2Mm` (two-distance chamfer: `lockDistances = false`, `distance1`, `distance2`) and `mode` (`offset`, or `apex` via `ChamferMode.Apex`) are EXPERIMENTAL and refused unless `experimental: true` is passed. They cannot be combined. The result then carries an `experimental` block with the values sent as `distance1` and `distance2`. The sign convention, which face gets which distance, and the Apex meaning are unverified.
 - New EXPERIMENTAL tool `plasticity_fillet_variable`, refused unless `experimental: true` (schema-required literal): base `radiusMm` plus `points` of `{edgeId, radiusMm, t (0..1) | pointMm}`, mapped to `FilletShellFactory.addVariationPoint`. The argument order of `addVariationPoint` is inferred from its declared arity of 2 (point, radius in metres) and the call is refused if the arity differs. `pointMm` is projected onto its edge by dense sampling of `GetPointAndTangent` and refused when more than 0.05 mm away; both paths hand the native edge position object to `addVariationPoint`, and the result returns the resolved `t`, point and distance for every variation point. After commit the body's faces are compared with the state before, and the call fails if no fillet face appeared. It cannot yet check the radii themselves.
+- New experimental tools for Plasticity Studio surfacing. None of the native argument names could be read without constructing a factory, so each tool checks that the field exists and reads back equal before committing, and fails loudly otherwise.
+  - `plasticity_polysplines_from_reference_mesh`: `referenceMeshIds` (OBJ or FBX meshes only; STL and 3MF are refused), optional booleans `roundedCorners`, `mergePatches`, `interpolateBoundary` (passed only when given). Uses `ConvertMeshToPolySplinesFactory` and reports the new bodies (count, faces, closed or sheet, bounds).
+  - `plasticity_import_polysplines`: `path` (.obj or .fbx), `sourceUnit` (millimeter, centimeter, meter, inch, foot), same three booleans. Uses `ImportPolySplinesFactory`; refuses to run when the factory has no `unit` field and points to the reference-mesh route instead.
+  - `plasticity_create_xsided_surface` (XNurbs): `edges` 3..64 of `{bodyId, edgeId, continuity?}`, optional global `continuity` (G0..G3), `uDegree`/`vDegree` (integer 2..11), `uSpans`/`vSpans` (integer 1..64), `quadSided` (requires exactly 4 edges), `toleranceMm` (greater than 0, at most 10). The boundary is checked to be a closed loop before the factory runs.
+  - `plasticity_set_shader_mode`: optional `mode` (matcaps, isophotes, draft, zebra_horizontal, zebra_vertical, topo, face_direction); omit to read the current mode. Drives the Shader mode panel buttons, creates no undo step and fails if the document revision changes.
 
 ### Live-verified status
 
@@ -32,7 +37,11 @@ Known limits: two sibling files with the same extension abort the export after t
 - Variable-fillet limit points (`addLimitPoint`, arity 3): argument meaning not readable.
 - Full round fillet (`fullRound`, `isFullRoundPossible`): `FilletShellFactory` has no settable flag that selects it (`mode` is a getter), so there is no verified way to trigger it. Not implemented rather than guessed.
 - Fillet shape, `yBlend`, `rho` and Tension: these accessors exist only on `MultiFilletShellFactory`; the MCP uses `FilletShellFactory`.
-- Studio-only tools (Square, Align Surfaces, XNurbs) are out of scope for the Indie licence.
+- Align Surfaces: `pairs` and reference formats are not readable.
+- Square fill: the `boundaries` shape is not readable.
+- Refit and Explicit Control on Rebuild Face: the factories expose no degree, spans or tolerance accessors with known names.
+- Multi-fillet (`MultiFilletShellFactory`): no `shell` accessor and the tension field is not on the prototype.
+- Curvature display is a separate overlay, not a shader mode.
 
 ## 0.2.1 — 2026-09-28
 

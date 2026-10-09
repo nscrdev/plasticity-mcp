@@ -2103,7 +2103,10 @@ function createServerWithCatalog(
       journal.push(entry);
       await persistJournalEntry(entry);
       onCompleted?.(before, after);
-      return isRuntimeState(value) ? compactMutationResult(after, sceneDiff) : value;
+      if (!isRuntimeState(value)) return value;
+      const experimental = (value as { experimental?: unknown }).experimental;
+      const compact = compactMutationResult<Record<string, unknown>>(after, sceneDiff);
+      return (experimental !== undefined ? { ...compact, experimental } : compact) as T;
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       entry.status = /timed?\s*out|(?:socket|connection|transport|session|client)\s+(?:was\s+)?closed|uncertain/i.test(message) ? "unknown" : "failed";
@@ -3153,11 +3156,11 @@ function createServerWithCatalog(
   });
   tool("plasticity_fillet", "Fillet current edge IDs with a radius in millimeters.", z.object({ id: z.number().int().positive(), edgeIds: z.array(z.string()).min(1), radiusMm: z.number().finite().positive(), intent, revision }), async ({ id, edgeIds, radiusMm, intent: purpose, revision: current }) =>
     await journaled("fillet", purpose, { id, edgeIds, radiusMm }, () => session.get().fillet(id, edgeIds, radiusMm, current)));
-  tool("plasticity_chamfer", "Chamfer current edge IDs by an equal distance in millimeters. Optional distance2Mm makes a two-distance chamfer (distanceMm is distance 1); mode \"apex\" selects the native Apex chamfer mode (default \"offset\"). The two options cannot be combined. The sign convention of the second distance and the Apex semantics come from native field names only and need a live check.", z.object({ id: z.number().int().positive(), edgeIds: z.array(z.string()).min(1), distanceMm: z.number().finite().positive(), distance2Mm: z.number().finite().positive().optional(), mode: z.enum(["offset", "apex"]).optional(), intent, revision }).strict().refine((value) => !(value.distance2Mm !== undefined && value.mode === "apex"), "distance2Mm cannot be combined with mode apex"), async ({ id, edgeIds, distanceMm, distance2Mm, mode, intent: purpose, revision: current }) => {
-    const options = { ...(distance2Mm !== undefined ? { distance2Mm } : {}), ...(mode !== undefined ? { mode } : {}) };
+  tool("plasticity_chamfer", "Chamfer current edge IDs by an equal distance in millimeters (stable path). EXPERIMENTAL, unverified against the live app and refused unless experimental: true is given: distance2Mm makes a two-distance chamfer (distanceMm is distance 1), and mode \"apex\" selects the native Apex chamfer mode (mode \"offset\" writes the native Offset mode explicitly). The two options cannot be combined. The sign convention of distance1/distance2 (sent negative, copied from the equal-distance path), which adjacent face receives which distance, and the Apex semantics are UNVERIFIED; the result reports which value was sent as distance1 and distance2. Measure the result before relying on it.", z.object({ id: z.number().int().positive(), edgeIds: z.array(z.string()).min(1), distanceMm: z.number().finite().positive(), distance2Mm: z.number().finite().positive().optional(), mode: z.enum(["offset", "apex"]).optional(), experimental: z.literal(true).optional(), intent, revision }).strict().refine((value) => !(value.distance2Mm !== undefined && value.mode === "apex"), "distance2Mm cannot be combined with mode apex").refine((value) => value.experimental === true || (value.distance2Mm === undefined && value.mode === undefined), "distance2Mm and mode are experimental; pass experimental: true"), async ({ id, edgeIds, distanceMm, distance2Mm, mode, experimental, intent: purpose, revision: current }) => {
+    const options = { ...(distance2Mm !== undefined ? { distance2Mm } : {}), ...(mode !== undefined ? { mode } : {}), ...(experimental !== undefined ? { experimental } : {}) };
     return await journaled("chamfer", purpose, { id, edgeIds, distanceMm, ...options }, () => session.get().chamfer(id, edgeIds, distanceMm, current, options));
   });
-  tool("plasticity_fillet_variable", "EXPERIMENTAL variable-radius fillet of current edge IDs. radiusMm is the base radius; each entry in points sets the radius at one position on one of those edges, either t (0..1 along the edge) or pointMm (world point in millimeters), plus radiusMm. Implemented as a separate tool because it needs a point list that does not fit plasticity_fillet's constant radius. The native FilletShellFactory.addVariationPoint argument order is inferred (declared arity 2) and the call is refused if the arity differs; verify on a scratch body before relying on it.", z.object({
+  tool("plasticity_fillet_variable", "EXPERIMENTAL variable-radius fillet of current edge IDs; unverified against the live app and refused unless experimental: true is given. radiusMm is the base radius; each entry in points sets the radius at one position on one of those edges, either t (0..1 along the edge) or pointMm (world point in millimeters), plus radiusMm. Implemented as a separate tool because it needs a point list that does not fit plasticity_fillet's constant radius. The native FilletShellFactory.addVariationPoint argument order is inferred (declared arity 2) and the call is refused if the arity differs. pointMm is projected onto its edge and refused when more than 0.05 mm off it; every variation point is resolved to a native edge position (t runs along the native edge direction) and the resolved t and point are returned. After commit the body faces are compared with the state before and the call fails if no fillet face appeared. Verify the radii on a scratch body before relying on it.", z.object({
     id: z.number().int().positive(),
     edgeIds: z.array(z.string()).min(1),
     radiusMm: z.number().finite().positive(),
@@ -3167,10 +3170,11 @@ function createServerWithCatalog(
       t: z.number().finite().min(0).max(1).optional(),
       pointMm: z.tuple([z.number().finite(), z.number().finite(), z.number().finite()]).optional(),
     }).strict().refine((point) => (point.t === undefined) !== (point.pointMm === undefined), "Provide exactly one of t or pointMm")).min(1).max(256),
+    experimental: z.literal(true),
     intent,
     revision,
-  }).strict(), async ({ id, edgeIds, radiusMm, points, intent: purpose, revision: current }) =>
-    await journaled("fillet-variable", purpose, { id, edgeIds, radiusMm, points }, () => session.get().filletVariable(id, edgeIds, radiusMm, points, current)));
+  }).strict(), async ({ id, edgeIds, radiusMm, points, experimental, intent: purpose, revision: current }) =>
+    await journaled("fillet-variable", purpose, { id, edgeIds, radiusMm, points, experimental }, () => session.get().filletVariable(id, edgeIds, radiusMm, points, current, { experimental })));
   tool("plasticity_remove_fillets", "Remove every native fillet recognized on one or more current Solid or Sheet bodies.", z.object({ ids, intent, revision }).strict(), async ({ ids: bodyIds, intent: purpose, revision: current }) =>
     await journaled("remove-fillets", purpose, { ids: bodyIds }, () => session.get().removeFillets(bodyIds, current)));
   tool("plasticity_refillet_faces", "Change recognized native fillet faces by a signed radius delta in millimeters.", z.object({ faces: z.array(faceRef).min(1).max(4096), deltaMm: nonzeroDistance, intent, revision }).strict(), async ({ faces, deltaMm, intent: purpose, revision: current }) =>

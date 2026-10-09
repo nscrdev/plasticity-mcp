@@ -1607,22 +1607,24 @@ test("MCP forwards extended OBJ options and perBody, and chamfer/variable fillet
       assert.equal(rejected.isError, true, JSON.stringify(bad));
     }
 
-    const chamfer = await client.callTool({ name: "plasticity_chamfer", arguments: { id: 7, edgeIds: ["e1"], distanceMm: 2, distance2Mm: 4, revision: "r1" } });
+    const chamfer = await client.callTool({ name: "plasticity_chamfer", arguments: { id: 7, edgeIds: ["e1"], distanceMm: 2, distance2Mm: 4, experimental: true, revision: "r1" } });
     assert.equal(chamfer.isError, undefined, JSON.stringify(chamfer));
-    assert.deepEqual(received.chamfer, [7, ["e1"], 2, "r1", { distance2Mm: 4 }]);
+    assert.deepEqual(received.chamfer, [7, ["e1"], 2, "r1", { distance2Mm: 4, experimental: true }]);
     await client.callTool({ name: "plasticity_chamfer", arguments: { id: 7, edgeIds: ["e1"], distanceMm: 2, revision: "r1" } });
     assert.deepEqual(received.chamfer, [7, ["e1"], 2, "r1", {}]);
-    for (const bad of [{ distance2Mm: 0 }, { mode: "bevel" }, { distance2Mm: 1, mode: "apex" }]) {
+    for (const bad of [{ distance2Mm: 0, experimental: true }, { mode: "bevel", experimental: true }, { distance2Mm: 1, mode: "apex", experimental: true }, { distance2Mm: 4 }, { mode: "apex" }, { mode: "offset" }, { experimental: false }]) {
       const rejected = await client.callTool({ name: "plasticity_chamfer", arguments: { id: 7, edgeIds: ["e1"], distanceMm: 2, revision: "r1", ...bad } });
       assert.equal(rejected.isError, true, JSON.stringify(bad));
     }
 
     const points = [{ edgeId: "e1", t: 0.5, radiusMm: 3 }, { edgeId: "e1", pointMm: [1, 2, 3], radiusMm: 2 }];
-    const variable = await client.callTool({ name: "plasticity_fillet_variable", arguments: { id: 7, edgeIds: ["e1"], radiusMm: 1, points, revision: "r1" } });
+    const variable = await client.callTool({ name: "plasticity_fillet_variable", arguments: { id: 7, edgeIds: ["e1"], radiusMm: 1, points, experimental: true, revision: "r1" } });
     assert.equal(variable.isError, undefined);
-    assert.deepEqual(received.variable, [7, ["e1"], 1, points, "r1"]);
+    assert.deepEqual(received.variable, [7, ["e1"], 1, points, "r1", { experimental: true }]);
+    const optedOut = await client.callTool({ name: "plasticity_fillet_variable", arguments: { id: 7, edgeIds: ["e1"], radiusMm: 1, points, revision: "r1" } });
+    assert.equal(optedOut.isError, true, "plasticity_fillet_variable requires the experimental opt-in");
     for (const bad of [[], [{ edgeId: "e1", radiusMm: 3 }], [{ edgeId: "e1", t: 1.2, radiusMm: 3 }], [{ edgeId: "e1", t: 0.5, pointMm: [0, 0, 0], radiusMm: 3 }], [{ edgeId: "e1", t: 0.5, radiusMm: 0 }]]) {
-      const rejected = await client.callTool({ name: "plasticity_fillet_variable", arguments: { id: 7, edgeIds: ["e1"], radiusMm: 1, points: bad, revision: "r1" } });
+      const rejected = await client.callTool({ name: "plasticity_fillet_variable", arguments: { id: 7, edgeIds: ["e1"], radiusMm: 1, points: bad, experimental: true, revision: "r1" } });
       assert.equal(rejected.isError, true, JSON.stringify(bad));
     }
   } finally {

@@ -2938,63 +2938,100 @@ test("converts a positive chamfer distance to the native negative fillet distanc
   assert.deepEqual(values, [{ id: 7, edgeIds: ["edge-1"], distance: -0.002 }]);
 });
 
-test("chamfer sets two-distance and apex fields only when asked", async () => {
-  let call: { source: string; bindings: string[]; values: unknown[] } | undefined;
+test("chamfer two-distance and apex are experimental opt-in and report the distances", async () => {
+  const box: { call: { source: string; bindings: string[]; values: unknown[] } | undefined } = { call: undefined };
+  const last = () => box.call;
   const state: RuntimeState = { targetId: "window-1", title: "Untitled - Plasticity", documentToken: "document-1", revision: "current-revision", dbVersion: 1, undoDepth: 0, redoDepth: 0, regions: [], construction: emptyConstruction, bodies: [] };
-  const runtime = { async getState() { return state; }, async mutate(source: string, bindings: string[], values: unknown[]) { call = { source, bindings, values }; return {}; } } as unknown as PlasticityRuntime;
+  const runtime = { async getState() { return state; }, async mutate(source: string, bindings: string[], values: unknown[]) { box.call = { source, bindings, values }; return {}; } } as unknown as PlasticityRuntime;
   const operations = new PlasticityOperations(runtime);
 
-  await operations.chamfer(7, ["e1"], 2, state.revision);
-  assert.deepEqual(call?.bindings, ["FilletShellFactory"]);
-  assert.doesNotMatch(call?.source ?? "", /distance1|chamferMode/u);
+  const plain = await operations.chamfer(7, ["e1"], 2, state.revision);
+  assert.deepEqual(last()?.bindings, ["FilletShellFactory"]);
+  assert.doesNotMatch(last()?.source ?? "", /distance1|chamferMode/u);
+  assert.equal("experimental" in plain, false);
 
-  await operations.chamfer(7, ["e1"], 2, state.revision, { distance2Mm: 5 });
-  assert.deepEqual(call?.bindings, ["FilletShellFactory", "ChamferMode"]);
-  assert.deepEqual(call?.values, [{ id: 7, edgeIds: ["e1"], distance: -0.002, distance2: -0.005 }]);
-  assert.match(call?.source ?? "", /factory\.lockDistances = false/u);
-  assert.match(call?.source ?? "", /factory\.distance1 = args\.distance/u);
-  assert.match(call?.source ?? "", /factory\.distance2 = args\.distance2/u);
+  // Without the opt-in nothing reaches the native layer.
+  box.call = undefined;
+  await assert.rejects(operations.chamfer(7, ["e1"], 2, state.revision, { distance2Mm: 5 }), /EXPERIMENTAL.*experimental: true/u);
+  await assert.rejects(operations.chamfer(7, ["e1"], 2, state.revision, { mode: "apex" }), /EXPERIMENTAL/u);
+  await assert.rejects(operations.chamfer(7, ["e1"], 2, state.revision, { mode: "offset" }), /EXPERIMENTAL/u);
+  assert.equal(last(), undefined);
 
-  await operations.chamfer(7, ["e1"], 2, state.revision, { mode: "apex" });
-  assert.deepEqual(call?.values, [{ id: 7, edgeIds: ["e1"], distance: -0.002, mode: "apex" }]);
-  assert.match(call?.source ?? "", /ChamferMode\.Apex/u);
+  const two = await operations.chamfer(7, ["e1"], 2, state.revision, { distance2Mm: 5, experimental: true });
+  assert.deepEqual(last()?.bindings, ["FilletShellFactory"], "ChamferMode is bound only when a mode is given");
+  assert.deepEqual(last()?.values, [{ id: 7, edgeIds: ["e1"], distance: -0.002, distance2: -0.005 }]);
+  assert.match(last()?.source ?? "", /factory\.lockDistances = false/u);
+  assert.match(last()?.source ?? "", /factory\.distance1 = args\.distance/u);
+  assert.match(last()?.source ?? "", /factory\.distance2 = args\.distance2/u);
+  assert.equal(two.experimental?.distance1Mm, 2);
+  assert.equal(two.experimental?.distance2Mm, 5);
+  assert.equal(two.experimental?.verified, false);
+  assert.match(two.experimental?.note ?? "", /unverified/u);
 
-  call = undefined;
-  await assert.rejects(operations.chamfer(7, ["e1"], 2, state.revision, { distance2Mm: 0 }), /distance2Mm/u);
-  await assert.rejects(operations.chamfer(7, ["e1"], 2, state.revision, { distance2Mm: 3, mode: "apex" }), /cannot be combined/u);
-  await assert.rejects(operations.chamfer(7, ["e1"], 2, state.revision, { mode: "bevel" as "apex" }), /offset or apex/u);
-  assert.equal(call, undefined);
+  const apex = await operations.chamfer(7, ["e1"], 2, state.revision, { mode: "apex", experimental: true });
+  assert.deepEqual(last()?.bindings, ["FilletShellFactory", "ChamferMode"]);
+  assert.deepEqual(last()?.values, [{ id: 7, edgeIds: ["e1"], distance: -0.002, mode: "apex" }]);
+  assert.match(last()?.source ?? "", /ChamferMode\.Apex/u);
+  assert.deepEqual([apex.experimental?.distance1Mm, apex.experimental?.distance2Mm, apex.experimental?.mode], [2, null, "apex"]);
+
+  box.call = undefined;
+  await assert.rejects(operations.chamfer(7, ["e1"], 2, state.revision, { distance2Mm: 0, experimental: true }), /distance2Mm/u);
+  await assert.rejects(operations.chamfer(7, ["e1"], 2, state.revision, { distance2Mm: 3, mode: "apex", experimental: true }), /cannot be combined/u);
+  await assert.rejects(operations.chamfer(7, ["e1"], 2, state.revision, { mode: "bevel" as "apex", experimental: true }), /offset or apex/u);
+  assert.equal(last(), undefined);
 });
 
-test("variable fillet maps t and explicit points to metre radii and validates input", async () => {
-  let call: { source: string; bindings: string[]; values: unknown[] } | undefined;
-  const state: RuntimeState = { targetId: "window-1", title: "Untitled - Plasticity", documentToken: "document-1", revision: "current-revision", dbVersion: 1, undoDepth: 0, redoDepth: 0, regions: [], construction: emptyConstruction, bodies: [] };
-  const runtime = { async getState() { return state; }, async mutate(source: string, bindings: string[], values: unknown[]) { call = { source, bindings, values }; return {}; } } as unknown as PlasticityRuntime;
+test("variable fillet is experimental opt-in and validates input", async () => {
+  const box: { call: { source: string; bindings: string[]; values: unknown[] } | undefined } = { call: undefined };
+  const last = () => box.call;
+  const body = { id: 7, versionId: 17, type: "Solid", name: null, boundsMm: null, faceIds: ["f1"], edgeIds: ["e1", "e2"], faces: [{ id: "f1", blendRadiusMm: null }], edges: [] };
+  let after = { ...body, faceIds: ["f1", "f2"], faces: [{ id: "f1", blendRadiusMm: null }, { id: "f2", blendRadiusMm: 2 }] };
+  let phase = 0;
+  const base = { targetId: "window-1", title: "Untitled - Plasticity", documentToken: "document-1", revision: "current-revision", dbVersion: 1, undoDepth: 0, redoDepth: 0, regions: [], construction: emptyConstruction };
+  const runtime = {
+    async getState() { return { ...base, bodies: [phase === 0 ? body : after] } as unknown as RuntimeState; },
+    async mutate(source: string, bindings: string[], values: unknown[]) { box.call = { source, bindings, values }; phase = 1; return [{ edgeId: "e1", t: 0.25, pointMm: [1, 2, 3], distanceMm: 0, radiusMm: 2 }]; },
+  } as unknown as PlasticityRuntime;
   const operations = new PlasticityOperations(runtime);
+  const opt = { experimental: true };
+  const rev = "current-revision";
 
-  await operations.filletVariable(7, ["e1", "e2"], 1, [
+  await assert.rejects(operations.filletVariable(7, ["e1"], 1, [{ edgeId: "e1", t: 0.5, radiusMm: 2 }], rev), /EXPERIMENTAL/u);
+  await assert.rejects(operations.filletVariable(7, ["e1"], 1, [{ edgeId: "e1", t: 0.5, radiusMm: 2 }], rev, { experimental: false }), /EXPERIMENTAL/u);
+  assert.equal(last(), undefined);
+
+  const result = await operations.filletVariable(7, ["e1", "e2"], 1, [
     { edgeId: "e1", t: 0.25, radiusMm: 2 },
     { edgeId: "e2", pointMm: [10, 20, 30], radiusMm: 3.5 },
-  ], state.revision);
-  assert.deepEqual(call?.bindings, ["FilletShellFactory"]);
-  assert.deepEqual(call?.values, [{
-    id: 7, edgeIds: ["e1", "e2"], distance: 0.001,
+  ], rev, opt);
+  assert.deepEqual(last()?.bindings, ["FilletShellFactory"]);
+  assert.deepEqual(last()?.values, [{
+    id: 7, edgeIds: ["e1", "e2"], distance: 0.001, maxPointDistance: 0.00005,
     points: [{ edgeId: "e1", radius: 0.002, t: 0.25 }, { edgeId: "e2", radius: 0.0035, point: [0.01, 0.02, 0.03] }],
   }]);
-  assert.match(call?.source ?? "", /addVariationPoint\.length !== 2/u);
-  assert.match(call?.source ?? "", /GetPointAndTangent\(entry\.t\)\.position/u);
+  assert.equal(result.experimental?.verified, false);
+  assert.deepEqual(result.experimental?.resolvedPoints, [{ edgeId: "e1", t: 0.25, pointMm: [1, 2, 3], distanceMm: 0, radiusMm: 2 }]);
+  assert.deepEqual([result.experimental?.faceCountBefore, result.experimental?.faceCountAfter, result.experimental?.newBlendFaceIds], [1, 2, ["f2"]]);
 
-  call = undefined;
+  // Read-back: unchanged topology after a "successful" commit fails loudly.
+  phase = 0;
+  after = { ...body };
+  await assert.rejects(operations.filletVariable(7, ["e1"], 1, [{ edgeId: "e1", t: 0.5, radiusMm: 2 }], rev, opt), /topology did not change/u);
+  after = { ...body, faceIds: ["f1", "f2"], faces: [{ id: "f1", blendRadiusMm: null }, { id: "f2", blendRadiusMm: 2 }] };
+
+  box.call = undefined;
+  phase = 0;
   const p = { edgeId: "e1", radiusMm: 2, t: 0.5 };
-  await assert.rejects(operations.filletVariable(7, ["e1"], 0, [p], state.revision), /base radius/u);
-  await assert.rejects(operations.filletVariable(7, ["e1"], 1, [], state.revision), /at least one/u);
-  await assert.rejects(operations.filletVariable(7, ["e1"], 1, [{ ...p, edgeId: "e9" }], state.revision), /not in edgeIds/u);
-  await assert.rejects(operations.filletVariable(7, ["e1"], 1, [{ ...p, radiusMm: 0 }], state.revision), /radiusMm/u);
-  await assert.rejects(operations.filletVariable(7, ["e1"], 1, [{ ...p, t: 1.5 }], state.revision), /0\.\.1/u);
-  await assert.rejects(operations.filletVariable(7, ["e1"], 1, [{ edgeId: "e1", radiusMm: 2 }], state.revision), /exactly one/u);
-  await assert.rejects(operations.filletVariable(7, ["e1"], 1, [{ ...p, pointMm: [0, 0, 0] }], state.revision), /exactly one/u);
-  await assert.rejects(operations.filletVariable(7, ["e1"], 1, [{ edgeId: "e1", radiusMm: 2, pointMm: [0, 0] as unknown as [number, number, number] }], state.revision), /three finite/u);
-  assert.equal(call, undefined);
+  await assert.rejects(operations.filletVariable(7, ["e1"], 0, [p], rev, opt), /base radius/u);
+  await assert.rejects(operations.filletVariable(7, ["e1"], 1, [], rev, opt), /at least one/u);
+  await assert.rejects(operations.filletVariable(7, ["e1"], 1, [{ ...p, edgeId: "e9" }], rev, opt), /not in edgeIds/u);
+  await assert.rejects(operations.filletVariable(7, ["e1"], 1, [{ ...p, radiusMm: 0 }], rev, opt), /radiusMm/u);
+  await assert.rejects(operations.filletVariable(7, ["e1"], 1, [{ ...p, t: 1.5 }], rev, opt), /0\.\.1/u);
+  await assert.rejects(operations.filletVariable(7, ["e1"], 1, [{ edgeId: "e1", radiusMm: 2 }], rev, opt), /exactly one/u);
+  await assert.rejects(operations.filletVariable(7, ["e1"], 1, [{ ...p, pointMm: [0, 0, 0] }], rev, opt), /exactly one/u);
+  await assert.rejects(operations.filletVariable(7, ["e1"], 1, [{ edgeId: "e1", radiusMm: 2, pointMm: [0, 0] as unknown as [number, number, number] }], rev, opt), /three finite/u);
+  await assert.rejects(operations.filletVariable(99, ["e1"], 1, [p], rev, opt), /Unknown current body/u);
+  assert.equal(last(), undefined);
 });
 
 test("removes recognized native fillets from current shell bodies", async () => {

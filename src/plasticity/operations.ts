@@ -443,11 +443,35 @@ export interface ObjMeshOptions {
 }
 
 export interface ChamferOptions {
-  /** Second distance for a two-distance chamfer, in mm. */
+  /** EXPERIMENTAL (needs experimental: true). Second distance for a two-distance chamfer, in mm. */
   distance2Mm?: number;
-  /** Native ChamferMode: Offset (default) or Apex. */
+  /** EXPERIMENTAL (needs experimental: true). Native ChamferMode: Offset or Apex. */
   mode?: "offset" | "apex";
+  /** Explicit opt-in for the unverified distance2Mm / mode paths. */
+  experimental?: boolean;
 }
+
+export interface ExperimentalChamferReport {
+  verified: false;
+  distance1Mm: number;
+  distance2Mm: number | null;
+  mode: "offset" | "apex" | null;
+  note: string;
+}
+
+export interface ExperimentalVariableFilletReport {
+  verified: false;
+  tIsAlongNativeEdgeDirection: true;
+  resolvedPoints: Array<{ edgeId: string; t: number; pointMm: Vector3; distanceMm: number; radiusMm: number }>;
+  faceCountBefore: number;
+  faceCountAfter: number;
+  newFaceIds: string[];
+  newBlendFaceIds: string[];
+  newBlendRadiiMm: Array<number | null>;
+}
+
+/** A pointMm farther than this from its named edge is refused (0.05 mm, in metres). */
+export const VARIABLE_FILLET_MAX_POINT_DISTANCE_M = 0.00005;
 
 export interface VariableFilletPoint {
   edgeId: string;
@@ -4845,17 +4869,21 @@ export class PlasticityOperations {
   }
 
   /**
-   * Equal-distance chamfer by default. `distance2Mm` switches to a two-distance chamfer
-   * (lockDistances = false, distance1/distance2); `mode: "apex"` sets ChamferMode.Apex.
-   * Field names come from the live 26.1.3 prototype; the sign convention of distance1/distance2
-   * (negative, like `distance`) and the Apex semantics are unverified until a live run.
+   * Equal-distance chamfer by default (byte-identical to the main branch behaviour). `distance2Mm` (two-distance,
+   * lockDistances = false, distance1/distance2) and `mode: "apex"` (ChamferMode.Apex) are EXPERIMENTAL and refused
+   * unless `experimental: true`. Field names come from the 26.1.3 prototype; the sign convention of
+   * distance1/distance2 (negative, like `distance`), which face gets which distance, and the Apex semantics are unverified.
    */
-  async chamfer(id: number, edgeIds: string[], distanceMm: number, revision: string, options: ChamferOptions = {}): Promise<RuntimeState> {
+  async chamfer(id: number, edgeIds: string[], distanceMm: number, revision: string, options: ChamferOptions = {}): Promise<RuntimeState & { experimental?: ExperimentalChamferReport }> {
     await this.assertRevision(revision);
-    const { distance2Mm, mode } = options;
+    const { distance2Mm, mode, experimental } = options;
+    if (experimental !== undefined && experimental !== true) throw new Error("Chamfer experimental must be true when given");
     if (distance2Mm !== undefined && (!Number.isFinite(distance2Mm) || distance2Mm <= 0)) throw new Error("Chamfer distance2Mm must be a positive finite millimeter value");
     if (mode !== undefined && mode !== "offset" && mode !== "apex") throw new Error("Chamfer mode must be offset or apex");
     if (distance2Mm !== undefined && mode === "apex") throw new Error("Chamfer distance2Mm cannot be combined with apex mode");
+    if ((distance2Mm !== undefined || mode !== undefined) && experimental !== true) {
+      throw new Error("Chamfer distance2Mm and mode are EXPERIMENTAL and unverified against the live app; pass experimental: true to use them");
+    }
     if (distance2Mm === undefined && mode === undefined) {
       await this.runtime.mutate(`async function (Factory, args) {
       ${findView}
@@ -4873,7 +4901,8 @@ export class PlasticityOperations {
     }`, ["FilletShellFactory"], [{ id, edgeIds, distance: -millimetersToMeters(distanceMm) }]);
       return await this.state();
     }
-    await this.runtime.mutate(`async function (Factory, ChamferMode, args) {
+    const signature = mode !== undefined ? "Factory, ChamferMode, args" : "Factory, args";
+    await this.runtime.mutate(`async function (${signature}) {
       ${findView}
       ${commandStart("FilletShellCommand")}
       const view = find(args.id);
@@ -4892,23 +4921,37 @@ export class PlasticityOperations {
       }
       if (args.mode !== undefined) factory.chamferMode = args.mode === 'apex' ? ChamferMode.Apex : ChamferMode.Offset;
       ${commandEnd}
-    }`, ["FilletShellFactory", "ChamferMode"], [{
+    }`, mode !== undefined ? ["FilletShellFactory", "ChamferMode"] : ["FilletShellFactory"], [{
       id,
       edgeIds,
       distance: -millimetersToMeters(distanceMm),
       ...(distance2Mm !== undefined ? { distance2: -millimetersToMeters(distance2Mm) } : {}),
       ...(mode !== undefined ? { mode } : {}),
     }]);
-    return await this.state();
+    const state = await this.state();
+    return {
+      ...state,
+      experimental: {
+        verified: false,
+        distance1Mm: distanceMm,
+        distance2Mm: distance2Mm ?? null,
+        mode: mode ?? null,
+        note: "distance1 and distance2 were sent as negative metres (sign convention copied from `distance`, unverified); which face received which distance depends on native edge orientation and is unverified; apex semantics unverified. Measure the result before relying on it.",
+      },
+    };
   }
 
   /**
-   * Variable-radius fillet. UNVERIFIED against the live app: `addVariationPoint` has declared arity 2 and the
-   * argument order (point, radius) in metres is inferred, not read. The script refuses to run when the arity differs.
-   * Each point is placed on a native edge at `t` (0..1 along the edge, GetPointAndTangent) or at an explicit point.
+   * EXPERIMENTAL variable-radius fillet, refused unless `experimental: true`. UNVERIFIED against the live app:
+   * `addVariationPoint` has declared arity 2 and the argument order (point, radius) in metres is inferred, not read.
+   * Every variation point is resolved to a native edge position (the `position` object of GetPointAndTangent) by
+   * either `t` or by projecting `pointMm` onto its edge (refused when farther than 0.05 mm), and the resolved
+   * t / point is returned. After commit the body's faces are compared with the state before and the call fails
+   * loudly when nothing changed.
    */
-  async filletVariable(id: number, edgeIds: string[], radiusMm: number, points: VariableFilletPoint[], revision: string): Promise<RuntimeState> {
-    await this.assertRevision(revision);
+  async filletVariable(id: number, edgeIds: string[], radiusMm: number, points: VariableFilletPoint[], revision: string, options: { experimental?: boolean } = {}): Promise<RuntimeState & { experimental?: ExperimentalVariableFilletReport }> {
+    if (options.experimental !== true) throw new Error("plasticity_fillet_variable is EXPERIMENTAL and unverified against the live app; pass experimental: true to use it");
+    const before = await this.assertRevision(revision);
     if (!Number.isFinite(radiusMm) || radiusMm <= 0) throw new Error("Variable fillet base radiusMm must be a positive finite millimeter value");
     if (points.length === 0) throw new Error("Variable fillet needs at least one variation point");
     const mapped = points.map((point) => {
@@ -4925,16 +4968,22 @@ export class PlasticityOperations {
         ...(hasT ? { t: point.t } : { point: point.pointMm!.map(millimetersToMeters) }),
       };
     });
-    await this.runtime.mutate(`async function (Factory, args) {
+    const beforeBody = before.bodies.find((body) => body.id === id);
+    if (!beforeBody) throw new Error(`Unknown current body: ${id}`);
+    const resolved = await this.runtime.mutate<Array<{ edgeId: string; t: number; pointMm: Vector3; distanceMm: number; radiusMm: number }>>(`async function (Factory, args) {
       ${findView}
-      ${commandStart("FilletShellCommand")}
+      const MAX_POINT_DISTANCE = args.maxPointDistance;
+      if (this.executor.isBusy) throw new Error('Plasticity is busy');
+      if (typeof Factory?.prototype?.addVariationPoint !== 'function' || Factory.prototype.addVariationPoint.length !== 2) {
+        throw new Error('FilletShellFactory.addVariationPoint does not have the expected two-argument signature; refusing to guess');
+      }
       const view = find(args.id);
       let item;
-      for (const [versionId, candidate] of editor.geo.geometryModel) {
-        if (editor.db.lookupStableId(versionId) === args.id) { item = candidate; break; }
+      for (const [versionId, candidate] of this.geo.geometryModel) {
+        if (this.db.lookupStableId(versionId) === args.id) { item = candidate; break; }
       }
       const edges = view.high.edges;
-      const modelEdges = item.model?.GetEdges?.();
+      const modelEdges = item?.model?.GetEdges?.();
       const resolveEdge = edgeId => {
         const index = edges.versionIds.indexOf(edgeId);
         if (index < 0) throw new Error('Stale or unknown edge: ' + edgeId);
@@ -4947,21 +4996,84 @@ export class PlasticityOperations {
         }
         throw new Error('Native B-Rep edge entity is unavailable');
       };
+      const distance = (a, b) => Math.hypot(a.x - b.x, a.y - b.y, a.z - b.z);
+      const projectOnto = (native, target) => {
+        const segments = 256;
+        let bestIndex = 0;
+        let bestDistance = Infinity;
+        for (let index = 0; index <= segments; index++) {
+          const d = distance(native.GetPointAndTangent(index / segments).position, target);
+          if (d < bestDistance) { bestDistance = d; bestIndex = index; }
+        }
+        let low = Math.max(0, (bestIndex - 1) / segments);
+        let high = Math.min(1, (bestIndex + 1) / segments);
+        for (let iteration = 0; iteration < 60; iteration++) {
+          const m1 = low + (high - low) / 3;
+          const m2 = high - (high - low) / 3;
+          if (distance(native.GetPointAndTangent(m1).position, target) < distance(native.GetPointAndTangent(m2).position, target)) high = m2; else low = m1;
+        }
+        const t = (low + high) / 2;
+        return { t, position: native.GetPointAndTangent(t).position };
+      };
+      const entries = args.points.map(entry => {
+        const native = nativeEdge(resolveEdge(entry.edgeId));
+        let t;
+        let position;
+        let off = 0;
+        if (entry.point) {
+          const target = { x: entry.point[0], y: entry.point[1], z: entry.point[2] };
+          const projected = projectOnto(native, target);
+          t = projected.t;
+          position = projected.position;
+          off = distance(position, target);
+          if (off > MAX_POINT_DISTANCE) throw new Error('Variation point is ' + (off * 1000).toFixed(3) + ' mm from edge ' + entry.edgeId + '; refusing (limit ' + (MAX_POINT_DISTANCE * 1000) + ' mm)');
+        } else {
+          t = entry.t;
+          position = native.GetPointAndTangent(t).position;
+        }
+        return { edgeId: entry.edgeId, t, position, off, radius: entry.radius };
+      });
+      ${commandStart("FilletShellCommand")}
       if (typeof factory.addVariationPoint !== 'function' || factory.addVariationPoint.length !== 2) {
         throw new Error('FilletShellFactory.addVariationPoint does not have the expected two-argument signature; refusing to guess');
       }
       factory.shell = view;
       factory.edges = args.edgeIds.map(resolveEdge);
       factory.distance = args.distance;
-      for (const entry of args.points) {
-        const point = entry.point
-          ? { x: entry.point[0], y: entry.point[1], z: entry.point[2] }
-          : nativeEdge(resolveEdge(entry.edgeId)).GetPointAndTangent(entry.t).position;
-        factory.addVariationPoint(point, entry.radius);
-      }
+      for (const entry of entries) factory.addVariationPoint(entry.position, entry.radius);
       ${commandEnd}
-    }`, ["FilletShellFactory"], [{ id, edgeIds, distance: millimetersToMeters(radiusMm), points: mapped }]);
-    return await this.state();
+      return entries.map(entry => ({
+        edgeId: entry.edgeId,
+        t: entry.t,
+        pointMm: [entry.position.x * 1000, entry.position.y * 1000, entry.position.z * 1000],
+        distanceMm: entry.off * 1000,
+        radiusMm: entry.radius * 1000,
+      }));
+    }`, ["FilletShellFactory"], [{ id, edgeIds, distance: millimetersToMeters(radiusMm), points: mapped, maxPointDistance: VARIABLE_FILLET_MAX_POINT_DISTANCE_M }]);
+    const after = await this.state();
+    const afterBody = after.bodies.find((body) => body.id === id);
+    if (!afterBody) {
+      throw new Error("Variable fillet committed but the body is no longer present under its id; inspect the scene before retrying (outcome unverified)");
+    }
+    const beforeFaceIds = new Set(beforeBody.faceIds);
+    const newFaces = afterBody.faces.filter((face) => !beforeFaceIds.has(face.id));
+    const newBlendFaces = newFaces.filter((face) => face.blendRadiusMm !== null);
+    if (newFaces.length === 0 || (afterBody.faces.length <= beforeBody.faces.length && newBlendFaces.length === 0)) {
+      throw new Error(`Variable fillet reported success but the body topology did not change as a fillet would (faces ${beforeBody.faces.length} -> ${afterBody.faces.length}, new faces ${newFaces.length}, new blend faces ${newBlendFaces.length}); the native call was probably ignored. Check the document before relying on it`);
+    }
+    return {
+      ...after,
+      experimental: {
+        verified: false,
+        tIsAlongNativeEdgeDirection: true,
+        resolvedPoints: resolved,
+        faceCountBefore: beforeBody.faces.length,
+        faceCountAfter: afterBody.faces.length,
+        newFaceIds: newFaces.map((face) => face.id),
+        newBlendFaceIds: newBlendFaces.map((face) => face.id),
+        newBlendRadiiMm: newBlendFaces.map((face) => face.blendRadiusMm),
+      },
+    };
   }
 
   async removeFillets(ids: number[], revision: string): Promise<RuntimeState> {

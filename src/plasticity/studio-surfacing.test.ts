@@ -85,7 +85,8 @@ test("checkClosedBoundary accepts a closed loop and names the open endpoint othe
   const refs = (count: number) => Array.from({ length: count }, (_, index) => ({ bodyId: 1, edgeId: `e${index}` }));
   assert.deepEqual(checkClosedBoundary(closed, refs(4)), { checked: true });
   assert.throws(() => checkClosedBoundary(closed, refs(3)), /do not form a closed loop.*0, 10, 0 mm|do not form a closed loop/u);
-  const missing = state([{ ...loopBody(1, positions, [[1, 2], [2, 3], [3, 4], [4, 1]]), vertices: undefined }]);
+  const { vertices: _dropped, ...noVertices } = loopBody(1, positions, [[1, 2], [2, 3], [3, 4], [4, 1]]);
+  const missing = state([noVertices]);
   assert.equal(checkClosedBoundary(missing, refs(4)).checked, false);
   assert.throws(() => checkClosedBoundary(closed, [{ bodyId: 1, edgeId: "nope" }]), /Unknown current edge/u);
   const wire = state([{ ...loopBody(2, positions, [[1, 2]]), type: "Wire" }]);

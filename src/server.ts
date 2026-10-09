@@ -11,6 +11,7 @@ import { ConstructionHistoryStore, type ConstructionHistoryEntry } from "./plast
 import { StepImportReferenceStore } from "./plasticity/import-reference-store.ts";
 import { StepReferenceDownloader, type StepReferenceDownloaderLike } from "./plasticity/step-reference-downloader.ts";
 import { PlasticityOperations } from "./plasticity/operations.ts";
+import { SHADER_MODE_NAMES, summarizeNewBodies, XSIDED_CONTINUITIES, XSIDED_LIMITS } from "./plasticity/studio-surfacing.ts";
 import { boundsCenter, quaternionFromXyzDegrees, rotateBoundsAroundPivot, unionBounds } from "./plasticity/print-orientation.ts";
 import { PlasticityRecipes } from "./plasticity/recipes.ts";
 import { SplitSolidByPlaneRecipe } from "./plasticity/split-solid.ts";
@@ -3417,6 +3418,66 @@ function createServerWithCatalog(
     revision,
   }).strict(), async ({ face, toleranceMm, intent: purpose, revision: current }) =>
     await journaled("rebuild-face", purpose, { face, toleranceMm }, () => session.get().rebuildFace(face, toleranceMm, current)));
+  const polySplinesOptionShape = {
+    roundedCorners: z.boolean().optional(),
+    mergePatches: z.boolean().optional(),
+    interpolateBoundary: z.boolean().optional(),
+  };
+  const polySplinesSummary = (snapshots: { before: RuntimeState; after: RuntimeState } | undefined) => {
+    if (!snapshots) throw new Error("PolySplines completed without a captured scene snapshot; reconcile the construction journal before retrying");
+    return summarizeNewBodies(snapshots.before, snapshots.after);
+  };
+  tool("plasticity_polysplines_from_reference_mesh", "EXPERIMENTAL (Plasticity Studio). Convert one or more reference meshes already in the document (imported from OBJ or FBX; STL and 3MF are refused) into G2 B-spline patch bodies with the native PolySplines converter, in one history step. Optional roundedCorners, mergePatches and interpolateBoundary map to the PolySplines dialog switches Rounded corners, Merge patches and Interpolate boundary exactly; each is sent only when given, so omitting them keeps the native defaults. The native field names for those three switches are inferred from the dialog and are checked to exist and read back before commit; if Plasticity does not expose them the call fails without creating geometry. Returns the new body IDs with face counts, bounds, size and whether each is a closed Solid or an open Sheet in polySplines. Fails when no body was created. PolySplines needs a clean quad-dominant mesh with no creases; the manual says creases are unsupported.", z.object({
+    referenceMeshIds: ids,
+    ...polySplinesOptionShape,
+    intent,
+    revision,
+  }).strict(), async ({ referenceMeshIds, roundedCorners, mergePatches, interpolateBoundary, intent: purpose, revision: current }) => {
+    const options = { ...(roundedCorners !== undefined ? { roundedCorners } : {}), ...(mergePatches !== undefined ? { mergePatches } : {}), ...(interpolateBoundary !== undefined ? { interpolateBoundary } : {}) };
+    let snapshots: { before: RuntimeState; after: RuntimeState } | undefined;
+    const result = await journaled("polysplines-from-reference-mesh", purpose, { referenceMeshIds, ...options }, () => session.get().polySplinesFromReferenceMeshes(referenceMeshIds, options, current), (before, after) => { snapshots = { before, after }; }, LONG_NATIVE_IMPORT_TIMEOUT_MS);
+    return { ...(result as object), experimental: true, appliedOptions: options, polySplines: polySplinesSummary(snapshots) };
+  });
+  tool("plasticity_import_polysplines", "EXPERIMENTAL (Plasticity Studio). Import a local OBJ or FBX file straight to G2 B-spline patch bodies through the native ImportPolySplines path, in one history step (STL is refused). sourceUnit is required because OBJ scale is ambiguous; if this Plasticity build exposes no unit field on the importer the call fails before importing, and the fallback is plasticity_import_reference_mesh followed by plasticity_polysplines_from_reference_mesh. Options roundedCorners, mergePatches and interpolateBoundary behave as in plasticity_polysplines_from_reference_mesh. The importer's file-path field is inferred from the other import factories: if no body appears the call fails. Verify the returned bounds against the expected size. Returns new body IDs, face counts, bounds, size and Solid or Sheet kind in polySplines.", z.object({
+    path: z.string().min(1),
+    sourceUnit: z.enum(["millimeter", "centimeter", "meter", "inch", "foot"]),
+    ...polySplinesOptionShape,
+    intent,
+    revision,
+  }).strict(), async ({ path, sourceUnit, roundedCorners, mergePatches, interpolateBoundary, intent: purpose, revision: current }) => {
+    const options = { ...(roundedCorners !== undefined ? { roundedCorners } : {}), ...(mergePatches !== undefined ? { mergePatches } : {}), ...(interpolateBoundary !== undefined ? { interpolateBoundary } : {}) };
+    let snapshots: { before: RuntimeState; after: RuntimeState } | undefined;
+    const result = await journaled("import-polysplines", purpose, { path, sourceUnit, ...options }, () => session.get().importPolySplines(path, sourceUnit, options, current), (before, after) => { snapshots = { before, after }; }, LONG_NATIVE_IMPORT_TIMEOUT_MS);
+    return { ...(result as object), experimental: true, appliedOptions: options, polySplines: polySplinesSummary(snapshots) };
+  });
+  tool("plasticity_create_xsided_surface", "EXPERIMENTAL (Plasticity Studio). N-sided (XNurbs) fill over a closed loop of 3..64 boundary edges taken from Sheets or Solids, as one history step; returns the new body. Edges are {bodyId, edgeId} references and the loop is checked to be closed from vertex positions before anything is sent. continuity (G0..G3) applies to every edge and a per-edge continuity overrides it; unset leaves the native default. Optional uDegree and vDegree (integer 2..11), uSpans and vSpans (integer 1..64), quadSided (needs exactly 4 edges) and toleranceMm (greater than 0, at most 10) map to the XNurbs fields of the same name, each sent only when given. Every value is read back from the native factory before commit and a mismatch aborts without creating geometry. toleranceMm is converted to metres on the assumption that the native tolerance is in model units. Square and Align are not exposed.", z.object({
+    edges: z.array(z.object({
+      bodyId: z.number().int().positive(),
+      edgeId: z.string().min(1),
+      continuity: z.enum(XSIDED_CONTINUITIES).optional(),
+    }).strict()).min(XSIDED_LIMITS.edges.min).max(XSIDED_LIMITS.edges.max),
+    continuity: z.enum(XSIDED_CONTINUITIES).optional(),
+    uDegree: z.number().int().min(XSIDED_LIMITS.degree.min).max(XSIDED_LIMITS.degree.max).optional(),
+    vDegree: z.number().int().min(XSIDED_LIMITS.degree.min).max(XSIDED_LIMITS.degree.max).optional(),
+    uSpans: z.number().int().min(XSIDED_LIMITS.spans.min).max(XSIDED_LIMITS.spans.max).optional(),
+    vSpans: z.number().int().min(XSIDED_LIMITS.spans.min).max(XSIDED_LIMITS.spans.max).optional(),
+    quadSided: z.boolean().optional(),
+    toleranceMm: z.number().finite().positive().max(XSIDED_LIMITS.toleranceMm.max).optional(),
+    intent,
+    revision,
+  }).strict(), async ({ edges, continuity, uDegree, vDegree, uSpans, vSpans, quadSided, toleranceMm, intent: purpose, revision: current }) => {
+    const options = {
+      ...(continuity !== undefined ? { continuity } : {}), ...(uDegree !== undefined ? { uDegree } : {}), ...(vDegree !== undefined ? { vDegree } : {}),
+      ...(uSpans !== undefined ? { uSpans } : {}), ...(vSpans !== undefined ? { vSpans } : {}), ...(quadSided !== undefined ? { quadSided } : {}),
+      ...(toleranceMm !== undefined ? { toleranceMm } : {}),
+    };
+    let snapshots: { before: RuntimeState; after: RuntimeState } | undefined;
+    const result = await journaled("create-xsided-surface", purpose, { edges, ...options }, () => session.get().createXSidedSurface(edges, options, current), (before, after) => { snapshots = { before, after }; }, LONG_NATIVE_IMPORT_TIMEOUT_MS);
+    return { ...(result as object), experimental: true, surface: snapshots ? summarizeNewBodies(snapshots.before, snapshots.after) : null };
+  });
+  tool("plasticity_set_shader_mode", "EXPERIMENTAL. Read or switch the Plasticity viewport shader mode so a following plasticity_screenshot shows surface quality. Modes: matcaps ceramic_dark, metal_carpaint, dark_shiny, gradient, ceramic_lightbulb, color_matcap, black_silhouette, color_silhouette; analysis modes isophotes, draft, zebra_horizontal, zebra_vertical, topo, face_direction. Curvature combs are a separate overlay and not a shader mode. Omit mode to only read the active mode. The response returns previous, current and available modes; switch back by passing previous (null means a custom matcap was active, which this tool cannot restore). It works by activating the same Shader mode panel button a user clicks, so the viewport settings sidebar must be mounted. This is viewport state: it adds no undo step and must not change the document revision, and the call errors if the revision changed. Allow a frame to render before plasticity_screenshot.", z.object({
+    mode: z.enum(SHADER_MODE_NAMES).optional(),
+  }).strict(), async ({ mode }) => await session.get().shaderMode(mode), false, { destructiveHint: false });
   tool("plasticity_match_faces", "Replace one or more exact current Solid or Sheet face surfaces with the carrier surface of one separate current replacement face. Plasticity extends or trims adjacent faces to meet the replacement surface and performs the direct edit in one history step. An external replacement body is preserved; the edited bodies keep their stable IDs, but all prior topology references become stale. Verify bounds, analytic surface type, mass properties, interference, and native validity afterward.", z.object({
     faces: surfaceFaceRefs,
     replacement: faceRef,
